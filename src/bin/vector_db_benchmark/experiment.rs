@@ -166,6 +166,7 @@ pub fn run(args: &Args) -> Result<(), String> {
         "vertex",
         "chroma",
     ];
+    let skip_vector_engines = ["redis", "valkey", "mongodb", "opensearch"];
     let mut engines: Vec<_> = engine_configs
         .iter()
         .filter(|(name, config)| {
@@ -181,6 +182,25 @@ pub fn run(args: &Args) -> Result<(), String> {
             args.engines.join(", "),
             supported_engines
         ));
+    }
+
+    // Exclude adapters without scalar support before any selection or namespace
+    // collision guard; skipped configs cannot collide with an executed workload.
+    if args.skip_vector_index {
+        engines.retain(|(_, config)| {
+            let engine_type = config.engine.as_deref().unwrap_or("unknown");
+            let supported = skip_vector_engines.contains(&engine_type);
+            if !supported {
+                eprintln!(
+                    "WARNING: --skip-vector-index not implemented for engine '{}', skipping",
+                    engine_type
+                );
+            }
+            supported
+        });
+        if engines.is_empty() {
+            return Err("No selected engines support --skip-vector-index".into());
+        }
     }
 
     if args.target_qps > 0.0 || args.search_duration > 0.0 {
@@ -199,19 +219,14 @@ pub fn run(args: &Args) -> Result<(), String> {
         }
     }
 
-    // --skip-vector-index: deduplicate engine configs by engine type.
-    // Multiple M/EF variants (e.g. redis-m-16-ef-64, redis-m-32-ef-128) collapse
-    // into a single "<engine_type>-no-vector" experiment.
+    // Scalar runs require one explicit config per engine; silently keeping the
+    // first would discard result-limit and index-setting differences.
     if args.skip_vector_index {
-        let mut seen_engine_types = std::collections::HashSet::new();
-        engines.retain(|(_, config)| {
-            let engine_type = config.engine.as_deref().unwrap_or("unknown");
-            seen_engine_types.insert(engine_type.to_string())
-        });
-        println!(
-            "--skip-vector-index: deduplicated to {} engine(s)",
-            engines.len()
-        );
+        vector_db_benchmark::filter_only::validate_engine_selection(
+            engines.iter().map(|(name, config)| {
+                (name.as_str(), config.engine.as_deref().unwrap_or("unknown"))
+            }),
+        )?;
     }
 
     // Collision guard (#151-4): among the selected configs, no two configs of the
@@ -220,7 +235,7 @@ pub fn run(args: &Args) -> Result<(), String> {
     // and keyspace with another's (the exact bug this fix closes). Also fires when
     // an `*_EXACT` pin is set with >1 config for that engine (every
     // config then resolves to the same verbatim base). In --skip-vector-index mode
-    // the dedup above already leaves one config per engine, so this is a no-op.
+    // selection validation above guarantees one config per engine.
     {
         use crate::engine::index_naming::{derive_index_name, index_name_exact};
         let mut seen: std::collections::HashMap<(String, String), String> =
@@ -296,8 +311,6 @@ pub fn run(args: &Args) -> Result<(), String> {
     );
     pb.enable_steady_tick(std::time::Duration::from_secs(1));
 
-    let skip_vector_engines = ["redis", "valkey", "mongodb"];
-
     // Soft wall-clock budget: once total elapsed reaches --timeout, stop launching
     // further experiments and finish cleanly. This bounds the overall run without
     // interrupting an in-flight experiment (the Rust runner is blocking, so a hard
@@ -335,13 +348,6 @@ pub fn run(args: &Args) -> Result<(), String> {
         let mut engine_config = (*engine_config).clone();
         if args.skip_vector_index {
             let engine_type = engine_config.engine.as_deref().unwrap_or("unknown");
-            if !skip_vector_engines.contains(&engine_type) {
-                eprintln!(
-                    "WARNING: --skip-vector-index not implemented for engine '{}', skipping",
-                    engine_type
-                );
-                continue;
-            }
             engine_config.name = format!("{}-no-vector", engine_type);
             engine_config.skip_vector_index = true;
         }
@@ -1426,18 +1432,19 @@ fn run_single_experiment(
         // Clone search params to avoid borrow conflict
         let all_search_params: Vec<_> = engine.search_params().to_vec();
 
-        // --skip-vector-index: dedup search params by parallel level only
-        // (ef values are irrelevant for filter-only queries)
+        // Collapse redundant EF configs, but never silently discard a different
+        // scalar result limit at the same concurrency.
         let effective_search_params: Vec<(usize, SearchParams)> = if skip_vector_index {
-            let mut seen_parallels = std::collections::HashSet::new();
-            all_search_params
-                .into_iter()
-                .enumerate()
-                .filter(|(_, sp)| {
-                    let p = sp.parallel.unwrap_or(1);
-                    seen_parallels.insert(p)
-                })
-                .collect()
+            vector_db_benchmark::filter_only::search_param_indices(
+                all_search_params.iter().map(|sp| (sp.parallel, sp.top)),
+                // --skip-vector-index canonicalizes names to <engine>-no-vector.
+                // Legacy adapters still derive their default from ground truth.
+                matches!(engine.name(), "redis-no-vector" | "opensearch-no-vector")
+                    .then_some(vector_db_benchmark::filter_only::DEFAULT_LIMIT as i64),
+            )?
+            .into_iter()
+            .map(|index| (index, all_search_params[index].clone()))
+            .collect()
         } else {
             all_search_params.into_iter().enumerate().collect()
         };
@@ -2403,6 +2410,29 @@ fn build_search_result_json(
     let gt_stats = ground_truth.and_then(|gt| gt.stats(results.top));
     result["metrics_schema"] = metrics_schema(gt_stats.as_ref());
 
+    if let Some(contract) = &results.filter_only {
+        result["params"]["workload"] = serde_json::json!("filter-only");
+        result["results"]["filter_only"] = serde_json::to_value(contract).unwrap();
+        result["metrics_schema"] = serde_json::json!({
+            "version": 2, "workload": "filter-only", "vector_quality": "not applicable",
+            "result_order": "unspecified", "returned_fields": "IDs only", "total_count": "exact",
+            "latency": "OpenSearch includes retry/backoff; Redis uses one attempt without reconnect/retry; connection setup and priming excluded"
+        });
+        for key in [
+            "mean_precision_at_returned",
+            "mean_recall",
+            "recall_p10",
+            "mean_mrr",
+            "mean_ndcg",
+            "precision_at_returned_dist",
+            "recall_dist",
+            "mrr_dist",
+            "ndcg_dist",
+        ] {
+            result["results"].as_object_mut().unwrap().remove(key);
+        }
+    }
+
     // How the swept parameter was chosen, and — crucially — whether the target
     // was actually reached. A calibration that converged on the maximum value
     // without reaching its target is not a calibration.
@@ -2446,13 +2476,15 @@ fn build_search_result_json(
         let results_obj = result["results"].as_object_mut().unwrap();
         // `precisions` is another upstream key name carrying upstream's per-query
         // recall@top values, so our array ships under an unambiguous name too.
-        results_obj.insert(
-            "precisions_at_returned".to_string(),
-            json!(results.precisions_at_returned),
-        );
-        results_obj.insert("recalls".to_string(), json!(results.recalls));
-        results_obj.insert("mrrs".to_string(), json!(results.mrrs));
-        results_obj.insert("ndcgs".to_string(), json!(results.ndcgs));
+        if results.filter_only.is_none() {
+            results_obj.insert(
+                "precisions_at_returned".to_string(),
+                json!(results.precisions_at_returned),
+            );
+            results_obj.insert("recalls".to_string(), json!(results.recalls));
+            results_obj.insert("mrrs".to_string(), json!(results.mrrs));
+            results_obj.insert("ndcgs".to_string(), json!(results.ndcgs));
+        }
         results_obj.insert("latencies".to_string(), json!(results.latencies));
     }
 
@@ -4261,5 +4293,112 @@ mod reuse_handler_tests {
             out.is_none(),
             "no verdict should be recorded for a run that measures nothing: {out:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod filter_only_serialization_tests {
+    use super::build_search_result_json;
+    use crate::{config::SearchParams, engine::SearchResults};
+    use serde_json::json;
+
+    #[test]
+    fn scalar_documents_omit_all_vector_quality_with_and_without_raw_arrays() {
+        let params: SearchParams = serde_json::from_value(json!({"parallel":1,"top":3})).unwrap();
+        for scalar in [false, true] {
+            for raw in [false, true] {
+                // Deliberately nonempty quality data makes accidental leakage
+                // visible; callers need not pre-clear values for serialization.
+                let results = SearchResults {
+                    top: 3,
+                    parallel: 1,
+                    requested_queries: 2,
+                    num_queries: 2,
+                    rps: 123.0,
+                    mean_time: 0.0015,
+                    p50_time: 0.0015,
+                    mean_precision_at_returned: 0.75,
+                    mean_recall: 0.5,
+                    mean_mrr: 0.5,
+                    mean_ndcg: 0.5,
+                    recall_p10: 0.5,
+                    precisions_at_returned: vec![0.5, 1.0],
+                    recalls: vec![0.5, 0.5],
+                    mrrs: vec![0.5, 0.5],
+                    ndcgs: vec![0.5, 0.5],
+                    latencies: vec![0.001, 0.002],
+                    filter_only: scalar.then_some(vector_db_benchmark::filter_only::Stats {
+                        result_limit: 3,
+                        matched_documents_sum: 17,
+                        returned_documents_sum: 6,
+                        retried_queries: 0,
+                    }),
+                    ..Default::default()
+                };
+                let doc = build_search_result_json(
+                    "test",
+                    "fixture",
+                    &params,
+                    &results,
+                    None,
+                    None,
+                    raw,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &json!({}),
+                );
+                let result = &doc["results"];
+                for key in [
+                    "mean_precision_at_returned",
+                    "mean_recall",
+                    "recall_p10",
+                    "mean_mrr",
+                    "mean_ndcg",
+                    "precision_at_returned_dist",
+                    "recall_dist",
+                    "mrr_dist",
+                    "ndcg_dist",
+                ] {
+                    assert_eq!(
+                        result.get(key).is_some(),
+                        !scalar,
+                        "{key}: scalar={scalar}, raw={raw}"
+                    );
+                }
+                for key in ["precisions_at_returned", "recalls", "mrrs", "ndcgs"] {
+                    assert_eq!(
+                        result.get(key).is_some(),
+                        !scalar && raw,
+                        "{key}: scalar={scalar}, raw={raw}"
+                    );
+                }
+                assert_eq!(result.get("latencies").is_some(), raw);
+                if raw {
+                    assert_eq!(result["latencies"], json!([0.001, 0.002]));
+                }
+                assert!(result["latency_hdr"].is_object());
+                assert_eq!(result["rps"], 123.0);
+                assert_eq!(result["p50_time"], 0.0015);
+                assert_eq!(result["requested_queries"], 2);
+                assert_eq!(result["succeeded_queries"], 2);
+                assert_eq!(result["failed_queries"], 0);
+                assert_eq!(result.get("filter_only").is_some(), scalar);
+                if scalar {
+                    assert_eq!(doc["params"]["workload"], "filter-only");
+                    assert_eq!(doc["metrics_schema"]["total_count"], "exact");
+                    assert_eq!(doc["metrics_schema"]["returned_fields"], "IDs only");
+                    assert_eq!(
+                        result["filter_only"],
+                        json!({"result_limit":3,"matched_documents_sum":17,"returned_documents_sum":6,"retried_queries":0})
+                    );
+                    assert!(doc["metrics_schema"].get("ground_truth").is_none());
+                } else {
+                    assert!(doc["params"].get("workload").is_none());
+                    assert_eq!(result["mean_recall"], 0.5);
+                }
+            }
+        }
     }
 }

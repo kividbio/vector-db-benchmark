@@ -143,7 +143,7 @@ Avoid selecting by glob here: `--engines 'opensearch-m-*'` matches only 6 of the
 
 Force-merge needs its own two bounds because it is not sized like the other requests. It merges the index down to a single segment, which rewrites the whole corpus: measured at 1,077–1,312 s for 1.18M vectors, well past the 300 s client-wide `OPENSEARCH_TIMEOUT`. Sharing that bound would abort every attempt client-side while the merge kept running on the server, and spend the whole `OPENSEARCH_INDEX_OP_MAX_RETRIES` budget failing a merge that was always going to succeed — discarding a completed multi-hour ingest at the last step. The wall-clock budget then bounds the retrying itself, since a per-attempt bound of an hour and eleven attempts is otherwise an ~11 h worst case. Both reject a malformed value loudly rather than silently falling back to the default.
 
-Search retries are deliberately short and additionally bounded by a wall-clock budget, because a single transport attempt can block for `OPENSEARCH_TIMEOUT`. **Backoff is excluded from the reported latency**: a retried query is billed only for the attempt that produced its result, so the percentiles stay comparable with engines that do not retry. Queries that needed a retry are counted and reported separately (`⚠ N of M search queries succeeded only after a retry`), since clean latency figures would otherwise hide that the server was shedding load.
+In vector mode, search retries are deliberately short and additionally bounded by a wall-clock budget, because a single transport attempt can block for `OPENSEARCH_TIMEOUT`. **Backoff is excluded from the reported latency**: a retried query is billed only for the attempt that produced its result, so the percentiles stay comparable with engines that do not retry. Queries that needed a retry are counted and reported separately (`⚠ N of M search queries succeeded only after a retry`), since clean latency figures would otherwise hide that the server was shedding load.
 
 Dropped queries are handled uniformly across all engines, not here: `failed_queries` is recorded in the results JSON and warned about, and `--fail-on-dropped-queries` makes it fatal. See that flag's help for why it is off by default.
 
@@ -416,8 +416,94 @@ check uses `ANALYZE` + `reltuples` and can therefore only warn, never abort.
 Two-phase workflows are unchanged, and now provably non-destructive: upload with
 `--keep-data`, then re-run with `--skip-upload --skip-if-exists false`. A
 filter-only two-phase run must pass `--skip-vector-index` in **both** phases —
-the flag renames the config to `<engine>-no-vector`, so phase 1 writes exactly the
-schema-only index phase 2 reuses.
+the flag renames the config to `<engine>-no-vector`. Redis derives its default
+index name from that config. OpenSearch uses `OPENSEARCH_INDEX` (default `bench`);
+both engines validate the realized scalar schema before reusing an index.
+
+### Redis / OpenSearch pure numeric and tag benchmarks
+
+`--skip-vector-index` also supports OpenSearch. On Redis and OpenSearch this
+mode measures metadata predicates with **IDs-only results, an exact total count,
+and unspecified result order**. `search_params.top` is the result limit (default
+10); it is independent of the vector ground-truth width. Vectors remain stored
+but are not indexed. OpenSearch maps scalar floats to `double` in this mode to
+preserve the precision of Redis NUMERIC values.
+
+Redis uses `FT.SEARCH ... NOCONTENT DIALECT 2`; OpenSearch uses `bool.filter`,
+`track_total_hits: true`, `_source: false`, and `_doc` order. Both exclude worker
+connection setup and one priming query from the timed window. OpenSearch scalar
+latency includes its bounded retries/backoff. Redis scalar queries use one attempt
+without reconnect/retry; a connection failure can fail subsequent queries on that
+worker. The downstream paired workflow fails on any dropped or retried query.
+This retry-policy difference must be considered when interpreting results under failures.
+This is a warm, immutable-corpus benchmark;
+results do not describe a mixed write workload or vector retrieval.
+
+Only queries with explicit predicates run. `--queries N` cycles those queries,
+and the experiment is named `<engine>-no-vector`. Select one engine config
+with one point per client count. Selecting multiple configs for the same engine
+with `--skip-vector-index` fails before download or connection; the runner never
+silently keeps the first. Adapters without scalar support are warned about and
+skipped before duplicate-selection and namespace checks. All `--skip-vector-index` engines reject
+conflicting `top` values at the same client count instead of silently picking one.
+Only Redis/OpenSearch treat omitted `top` as 10; legacy Valkey/MongoDB derive
+it from ground truth, so mixing an omitted and explicit limit is rejected.
+Use `--fail-on-dropped-queries --repetitions 1` for paired
+runs. Search and summary JSONs carry `workload: filter-only`, the result limit,
+and sums of exact match and returned-ID counts. The Redis and OpenSearch scalar
+contract also records `filter_only.retried_queries`: successful measured queries
+requiring retries, excluding priming queries. Redis always reports zero. A clean
+paired comparison requires zero dropped queries and zero retried queries. The
+driver records retries and warns, but `--fail-on-dropped-queries` checks dropped
+queries only. Retry rejection is enforced by the downstream
+[paired workflow validator](https://github.com/redis-performance/cloud-benchmarks-private/pull/76);
+a standalone driver invocation can succeed with a nonzero retry count.
+These two engines omit vector-quality fields; legacy filter-only engines keep
+their existing output format.
+The count sums let paired runs detect disagreement; they are not a substitute
+for validating predicates against an independent oracle. Integration tests use
+unequal category populations, exact numeric/tag values, floating-point range
+boundaries, AND/OR, and an empty result, and inspect the realized server schema.
+
+Redis filter-only workers require RESP3 and reject replies with any warning,
+including partial results from query timeouts. Replies must include the complete
+RESP3 warning metadata; missing metadata fails closed. No server configuration
+changes are required. Managed deployments must expose that response contract;
+the Redis Cloud benchmark has not yet validated it.
+
+The realized index schema is checked before timing, including index reuse:
+vector indexes are rejected, numeric fields retain double precision, and tags
+are case-sensitive; reused OpenSearch keyword fields cannot set `ignore_above`
+or enable `split_queries_on_whitespace`.
+OpenSearch does not require `_id` fielddata. The common
+numeric/tag mode accepts predicates only on explicitly declared `keyword`, `int`,
+or `float` fields. Unknown fields, missing schema declarations, and text, geo,
+datetime, or other field types are rejected in predicates, including inside
+boolean groups. Groups must contain nonempty arrays of predicate objects and
+cannot have sibling field leaves; `and` and `or` may coexist. Match criteria
+must contain exactly one of `value` or `any`, and ranges allow at most one lower
+and one upper bound. Ambiguous or malformed clauses are rejected instead of
+silently dropped. Unqueried extra metadata may remain stored. KNN modes retain
+their existing predicate support.
+The common domain also rejects empty tags, tags containing `;` or edge whitespace,
+integers outside +/-2^53, and negative floating-point zero (whose equality
+semantics differ between the engines). Floating-point keyword metadata is also
+rejected because the upload paths stringify it differently; provide explicit
+strings for those tokens. Integer keyword tokens remain supported. Numeric operands must be JSON numbers; numeric
+`match.any` accepts integer lists. These checks run before upload/search timing. On reuse, payloads are validated
+one row at a time and corpus size is checked from the NPY header; vector values
+are neither loaded nor decoded.
+
+This changes Redis filter-only response shaping from full documents to IDs only
+and uses DIALECT 2 instead of 4 to avoid optimizations that can skip exact counting;
+old filter-only timings and Valkey's legacy filter-only path are not directly
+comparable. KNN behavior is unchanged.
+
+Run `make agent-check`, `make integration-test`, and
+`make integration-test-opensearch` to verify the contract. For instrumented
+library, CLI, and real-server coverage, install `cargo-llvm-cov` and the Rust
+`llvm-tools-preview` component, then run `make coverage-filter-only`. JSON and
+LCOV reports are written under `target/filter-only-coverage/reports/`.
 
 ### Per-config index isolation (Redis / Valkey / Dragonfly / KiviDB / VectorSets)
 

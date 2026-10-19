@@ -105,6 +105,10 @@ test:
 	@echo "=== Running Rust unit tests ==="
 	cargo test --lib --release -- --nocapture
 
+.PHONY: test-filter-only-debug
+test-filter-only-debug:
+	cargo test --lib filter_only::
+
 .PHONY: test-verbose
 test-verbose:
 	@echo "=== Running Rust unit tests (verbose) ==="
@@ -117,7 +121,7 @@ test-verbose:
 .PHONY: integration-test
 integration-test:
 	@echo "=== Starting redis:8.6.0 for integration tests ==="
-	docker compose -f tests/docker-compose.test.yml up -d --wait
+	docker compose -f tests/docker-compose.test.yml up -d redis --wait
 	@echo "=== Running integration tests ==="
 	cargo test --test integration_redis --release -- --nocapture --test-threads=1; \
 	EXIT_CODE=$$?; \
@@ -492,3 +496,20 @@ help:
 	@echo "Environment variables:"
 	@echo "  HDF5_DIR          - Path to HDF5 library (default: /usr/lib/<arch>/hdf5/serial)"
 
+
+# Instrument the actual CLI used by the integration harness, as well as library
+# and binary unit tests. Requires cargo-llvm-cov and rustup llvm-tools-preview.
+# Keep coverage artifacts separate from normal builds and emit portable reports.
+COVERAGE_DIR ?= $(CURDIR)/target/filter-only-coverage
+.PHONY: coverage-filter-only
+coverage-filter-only:
+	@set -eu; \
+	export CARGO_TARGET_DIR="$(COVERAGE_DIR)"; \
+	eval "$$(cargo llvm-cov show-env --sh)"; \
+	cargo llvm-cov clean --workspace; \
+	$(MAKE) agent-check-test; \
+	$(MAKE) integration-test; \
+	$(MAKE) integration-test-opensearch; \
+	mkdir -p "$(COVERAGE_DIR)/reports"; \
+	cargo llvm-cov report --release --json --output-path "$(COVERAGE_DIR)/reports/coverage.json"; \
+	cargo llvm-cov report --release --lcov --output-path "$(COVERAGE_DIR)/reports/lcov.info"
