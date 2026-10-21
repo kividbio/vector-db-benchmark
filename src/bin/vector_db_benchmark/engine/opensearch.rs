@@ -13,7 +13,7 @@ use opensearch::http::request::JsonBody;
 use opensearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
 use opensearch::indices::{
     IndicesCreateParts, IndicesDeleteParts, IndicesGetMappingParts, IndicesGetSettingsParts,
-    IndicesPutSettingsParts, IndicesRefreshParts,
+    IndicesRefreshParts,
 };
 use opensearch::params::WaitForStatus;
 use opensearch::{BulkParts, CountParts, OpenSearch, SearchParts};
@@ -64,6 +64,14 @@ pub struct OpenSearchEngine {
 
 impl OpenSearchEngine {
     pub fn new(engine_config: &EngineConfig, host: &str) -> Result<Self, String> {
+        for params in engine_config.search_params.iter().flatten() {
+            if params.knob("knn.algo_param.ef_search").is_some() {
+                return Err("OpenSearch Lucene ignores knn.algo_param.ef_search; use search_params.ef for query-level effort".into());
+            }
+            vector_db_benchmark::opensearch_query::validate_ef(
+                params.search_params.as_ref().and_then(|p| p.ef),
+            )?;
+        }
         let port: u16 = crate::effective_config::env_parsed("OPENSEARCH_PORT", 9200);
 
         let index_name = crate::effective_config::env_or("OPENSEARCH_INDEX", "bench");
@@ -619,43 +627,6 @@ impl OpenSearchEngine {
             backoff_sleep(policy.base_delay_ms, attempt);
             attempt += 1;
         }
-    }
-
-    /// Apply search-time settings (e.g., knn.algo_param.ef_search)
-    fn setup_search(&self, params: &SearchParams) -> Result<(), String> {
-        // Cold-cache graph loading is warmed uniformly by the per-worker prime
-        // query in `search` (mirrors redis/vertex), so no engine-specific
-        // server-side `_knn/warmup` call is needed here.
-        // Accepted flat (our configs) or nested under `search_params`/`config`
-        // (upstream's) — see SearchParams::knob.
-        let ef_search = params
-            .knob("knn.algo_param.ef_search")
-            .and_then(|v| v.as_i64());
-
-        if let Some(ef) = ef_search {
-            let body = serde_json::json!({
-                "index": {
-                    "knn.algo_param.ef_search": ef,
-                }
-            });
-
-            let resp = self
-                .rt
-                .block_on(
-                    self.client
-                        .indices()
-                        .put_settings(IndicesPutSettingsParts::Index(&[&self.index_name]))
-                        .body(body)
-                        .send(),
-                )
-                .map_err(|e| format!("Failed to apply search settings: {}", e))?;
-
-            if !resp.status_code().is_success() {
-                let text = self.rt.block_on(resp.text()).unwrap_or_default();
-                eprintln!("Warning: failed to set ef_search={}: {}", ef, text);
-            }
-        }
-        Ok(())
     }
 }
 
@@ -1566,43 +1537,19 @@ fn item_is_retryable(item: &serde_json::Value) -> bool {
     )
 }
 
-/// OpenSearch KNN search (different format from Elasticsearch).
-/// Uses {"query": {"knn": {"vector": {"vector": [...], "k": top}}}} format.
-/// Build the OpenSearch kNN search body.
-///
-/// Efficient (pre-)filtering: the filter is pushed *inside* the kNN clause so the
-/// Lucene engine applies it during graph traversal. Wrapping the kNN query in an
-/// outer `bool.must` + `filter` instead performs post-filtering, which collapses
-/// recall on filtered datasets (see qdrant/vector-db-benchmark#167). Requires the
-/// `lucene` engine, which our index mapping uses (see `configure`).
+/// Resolve the typed search knob on the actual request construction path.
 fn build_knn_body(
     query_vector: &[f32],
     top: usize,
     filter: Option<&serde_json::Value>,
-) -> serde_json::Value {
-    let mut query = serde_json::json!({
-        "knn": {
-            "vector": {
-                "vector": query_vector,
-                "k": top,
-            }
-        }
-    });
-
-    if let Some(f) = filter {
-        query["knn"]["vector"]["filter"] = f.clone();
-    }
-
-    // Response trimming: the benchmark only needs each hit's id, so skip loading
-    // `_source` and stored fields and return `_id` via a doc-value field. This
-    // trims the response payload for a fairer QPS/latency measurement.
-    serde_json::json!({
-        "query": query,
-        "size": top,
-        "_source": false,
-        "docvalue_fields": ["_id"],
-        "stored_fields": "_none_",
-    })
+    params: &SearchParams,
+) -> Result<serde_json::Value, String> {
+    vector_db_benchmark::opensearch_query::build_knn_body(
+        query_vector,
+        top,
+        filter,
+        params.search_params.as_ref().and_then(|p| p.ef),
+    )
 }
 
 /// Extract the document id from a search hit. With response trimming the id is
@@ -1807,6 +1754,33 @@ impl Engine for OpenSearchEngine {
     }
 
     fn configure(&mut self, dataset: &Dataset) -> Result<(), String> {
+        // Probe before any index deletion, creation, upload, or force merge.
+        if !self.config.skip_vector_index
+            && self
+                .search_params
+                .iter()
+                .any(|p| p.search_params.as_ref().and_then(|p| p.ef).is_some())
+        {
+            let response = self
+                .rt
+                .block_on(self.client.info().send())
+                .map_err(|e| format!("Unable to verify OpenSearch query-effort support: {e}"))?;
+            if !response.status_code().is_success() {
+                return Err(format!(
+                    "Unable to verify OpenSearch query-effort support: HTTP {}",
+                    response.status_code()
+                ));
+            }
+            let info: serde_json::Value = self
+                .rt
+                .block_on(response.json())
+                .map_err(|e| format!("Unable to parse OpenSearch version response: {e}"))?;
+            let version = info
+                .pointer("/version/number")
+                .and_then(|v| v.as_str())
+                .ok_or("OpenSearch version response is missing version.number")?;
+            vector_db_benchmark::opensearch_query::validate_server_version(version)?;
+        }
         self.scalar_metadata_validated = false;
         // Shard count is printed alongside the HNSW knobs so a sweep point is
         // honestly labelled rather than silently measured at whatever the cluster
@@ -1926,10 +1900,7 @@ impl Engine for OpenSearchEngine {
     ) -> Result<SearchResults, String> {
         let parallel = params.parallel.unwrap_or(1) as usize;
 
-        // Apply search-time settings (ef_search)
-        if !self.config.skip_vector_index {
-            self.setup_search(params)?;
-        } else {
+        if self.config.skip_vector_index {
             self.validate_filter_only_schema(dataset)?;
             if !self.scalar_metadata_validated {
                 dataset.validate_scalar_metadata()?;
@@ -2008,11 +1979,16 @@ impl Engine for OpenSearchEngine {
                         tops[idx],
                     )
                 } else {
-                    build_knn_body(&queries[idx], tops[idx], parsed_filters[idx].as_ref())
+                    build_knn_body(
+                        &queries[idx],
+                        tops[idx],
+                        parsed_filters[idx].as_ref(),
+                        params,
+                    )?
                 };
-                serde_json::value::to_raw_value(&body).expect("serialize KNN search body")
+                serde_json::value::to_raw_value(&body).map_err(|e| e.to_string())
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
 
         // Per-thread sample buffers merged on join — no per-query Mutex<Vec>
         // contention in the timed loop (see redis.rs::search). Metrics are
@@ -2276,18 +2252,98 @@ mod tests {
         let top = 2usize;
         let filter = json!({"term": {"color": "red"}});
 
-        let body = build_knn_body(&vec, top, Some(&filter));
+        let params = serde_json::from_value(json!({})).unwrap();
+        let body = build_knn_body(&vec, top, Some(&filter), &params).unwrap();
         let to_vec_bytes = serde_json::to_vec(&body).unwrap();
         let raw = serde_json::value::to_raw_value(&body).unwrap();
         assert_eq!(raw.get().as_bytes(), to_vec_bytes.as_slice());
 
         // Unfiltered variant.
-        let body_nf = build_knn_body(&vec, top, None);
+        let body_nf = build_knn_body(&vec, top, None, &params).unwrap();
         let raw_nf = serde_json::value::to_raw_value(&body_nf).unwrap();
         assert_eq!(
             raw_nf.get().as_bytes(),
             serde_json::to_vec(&body_nf).unwrap().as_slice()
         );
+    }
+
+    #[test]
+    fn legacy_query_effort_is_rejected_before_client_or_upload() {
+        for entry in [
+            json!({"knn.algo_param.ef_search": 128}),
+            json!({"search_params": {"knn.algo_param.ef_search": 128}}),
+            json!({"config": {"knn.algo_param.ef_search": 128}}),
+        ] {
+            let config: EngineConfig = serde_json::from_value(json!({
+                "name": "legacy-effort", "engine": "opensearch",
+                "search_params": [{"search_params": {"ef": 128}}, entry]
+            }))
+            .unwrap();
+            let error = OpenSearchEngine::new(&config, "invalid host")
+                .err()
+                .unwrap();
+            assert!(error.contains("use search_params.ef"), "{error}");
+        }
+    }
+
+    #[test]
+    fn invalid_query_effort_is_rejected_before_client_or_upload() {
+        let config: EngineConfig = serde_json::from_value(json!({
+            "name": "invalid-effort", "engine": "opensearch",
+            "search_params": [{"search_params": {"ef": 128}}, {"search_params": {"ef": 0}}]
+        }))
+        .unwrap();
+        let error = OpenSearchEngine::new(&config, "invalid host")
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("query ef must be a positive 32-bit integer"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn shipped_sweeps_send_query_effort_instead_of_ignored_index_settings() {
+        for file in ["opensearch-single-node.json", "opensearch-5-shard.json"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("experiments/configurations")
+                .join(file);
+            let configs: Vec<EngineConfig> =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            assert!(!configs.is_empty());
+            for config in configs {
+                for params in config.search_params.unwrap() {
+                    assert!(params.knob("knn.algo_param.ef_search").is_none());
+                    let ef = params.search_params.as_ref().and_then(|p| p.ef).unwrap();
+                    let body = build_knn_body(&[0.1], 25, None, &params).unwrap();
+                    assert_eq!(
+                        body["query"]["knn"]["vector"]["method_parameters"]["ef_search"],
+                        ef
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn query_effort_reaches_the_request_without_changing_k_or_filter() {
+        let filter = json!({"range": {"price": {"gte": 3, "lte": 7}}});
+        for key in ["search_params", "config"] {
+            for ef_key in ["ef", "EF"] {
+                let params: SearchParams = serde_json::from_value(json!({
+                    "top": 25, key: {ef_key: 512}
+                }))
+                .unwrap();
+                let body = build_knn_body(&[0.1, 0.2], 25, Some(&filter), &params).unwrap();
+                assert_eq!(
+                    body["query"]["knn"]["vector"]["method_parameters"]["ef_search"],
+                    512
+                );
+                assert_eq!(body["query"]["knn"]["vector"]["k"], 25);
+                assert_eq!(body["size"], 25);
+                assert_eq!(body["query"]["knn"]["vector"]["filter"], filter);
+            }
+        }
     }
 
     #[test]
@@ -2361,7 +2417,13 @@ mod tests {
     #[test]
     fn knn_filter_is_pushed_inside_knn_clause() {
         let filter = json!({"bool": {"must": [{"match": {"a": 1}}]}});
-        let body = build_knn_body(&[0.1, 0.2, 0.3], 10, Some(&filter));
+        let body = build_knn_body(
+            &[0.1, 0.2, 0.3],
+            10,
+            Some(&filter),
+            &serde_json::from_value(json!({})).unwrap(),
+        )
+        .unwrap();
 
         // Filter lives at query.knn.vector.filter ...
         assert_eq!(body["query"]["knn"]["vector"]["filter"], filter);
@@ -2376,14 +2438,26 @@ mod tests {
 
     #[test]
     fn knn_body_without_filter_has_no_filter_key() {
-        let body = build_knn_body(&[0.1, 0.2], 5, None);
+        let body = build_knn_body(
+            &[0.1, 0.2],
+            5,
+            None,
+            &serde_json::from_value(json!({})).unwrap(),
+        )
+        .unwrap();
         assert!(body["query"]["knn"]["vector"].get("filter").is_none());
     }
 
     #[test]
     fn knn_body_trims_the_response() {
         // Response trimming: no _source, ids via doc-value, no stored fields.
-        let body = build_knn_body(&[0.1, 0.2], 5, None);
+        let body = build_knn_body(
+            &[0.1, 0.2],
+            5,
+            None,
+            &serde_json::from_value(json!({})).unwrap(),
+        )
+        .unwrap();
         assert_eq!(body["_source"], serde_json::json!(false));
         assert_eq!(body["docvalue_fields"], serde_json::json!(["_id"]));
         assert_eq!(body["stored_fields"], serde_json::json!("_none_"));
