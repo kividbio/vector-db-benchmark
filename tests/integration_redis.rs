@@ -4897,12 +4897,263 @@ fn test_binary_redis_fulltext_refuses_unpinned_or_incomplete_index() {
         .arg(&index)
         .query::<()>(&mut conn);
     assert!(run(&["--skip-search", "--keep-data"]).status.success());
+    // #358 review: an english index without a marker (built before markers
+    // existed) is reused, and the result records the marker the index
+    // actually carries — none — not the one this run would have written.
+    let _ = redis::cmd("DEL")
+        .arg(vector_db_benchmark::fulltext::redis_marker_key(&index))
+        .query::<()>(&mut conn);
+    common::clear_result_files(&proj.root);
     let ok = run(&["--skip-upload", "--exit-on-error"]);
     assert!(
         ok.status.success(),
         "{}",
         String::from_utf8_lossy(&ok.stderr)
     );
+    let doc = common::read_result_doc(&proj.root, name);
+    let ft = &doc["params"]["fulltext"];
+    assert!(ft["index_marker"].is_null(), "{}", ft["index_marker"]);
+    assert_eq!(
+        ft["index_marker_expected"],
+        vector_db_benchmark::fulltext::IndexProfile::english().marker()
+    );
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #339 follow-up: `analysis: parity` end to end on Redis — no stemming,
+/// whitespace normalization at upload (verified on the stored hash), only the
+/// searched fields indexed (`NOSTEM`), and refusal of an index uploaded in the
+/// other mode when reused through `--skip-upload`, in both directions.
+#[test]
+fn test_binary_redis_fulltext_parity() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let name = "redis-bm25-parity";
+    let write_config = |root: &std::path::Path, search_params: serde_json::Value| {
+        fs::write(
+            root.join("experiments/configurations/test.json"),
+            serde_json::json!([{"name": name, "engine": "redis",
+                "upload_params": {"parallel": 1}, "search_params": search_params}])
+            .to_string(),
+        )
+        .unwrap();
+    };
+    let proj = common::write_bm25_project("[]");
+    write_config(&proj.root, common::bm25_parity_search_params());
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    let envs = [("REDIS_PORT", port.as_str())];
+    assert!(common::run_binary_extra(
+        &proj.root,
+        name,
+        common::BM25_DATASET,
+        TEST_HOST,
+        &envs,
+        &[
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries",
+            "--keep-data"
+        ]
+    ));
+    common::assert_bm25_parity_run(&proj.root, &dump, "redis", name);
+    // The uploaded copy of the indexed field was normalized; the unindexed
+    // title is untouched (it holds no newline in the fixture anyway).
+    let headings: String = redis::cmd("HGET")
+        .arg(format!("{name}:4"))
+        .arg("headings")
+        .query(&mut conn)
+        .unwrap();
+    assert_eq!(headings, "alpha beta");
+    let run = |extra: &[&str]| {
+        common::run_binary_output(
+            &proj.root,
+            name,
+            common::BM25_DATASET,
+            TEST_HOST,
+            &envs,
+            extra,
+        )
+    };
+    let refused = |out: std::process::Output, needle: &str| {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "must refuse: {stderr}");
+        assert!(stderr.contains(needle), "expected {needle:?} in: {stderr}");
+    };
+    let english = serde_json::json!([{"parallel": 1, "top": 5, "workload": "fulltext",
+        "fulltext": {"fields": {"headings": 1.0, "segment": 1.0}}}]);
+    // Parity index reused in english mode: refused (marker says normalized).
+    write_config(&proj.root, english.clone());
+    refused(
+        run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
+        "the index records analysis",
+    );
+    // English index (stemmed, unnormalized upload) reused in parity: refused.
+    common::clear_result_files(&proj.root);
+    assert!(run(&["--skip-search", "--keep-data"]).status.success());
+    write_config(&proj.root, common::bm25_parity_search_params());
+    refused(
+        run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
+        "without whitespace normalization",
+    );
+    flush_db(&mut conn);
+    let _ = redis::cmd("DEL")
+        .arg(format!("vdbb:fulltext-profile:idx:{name}"))
+        .query::<()>(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #358 review 3: a vector-only config never touches a key outside its own
+/// prefix — the fulltext marker key in particular. Run it as an ACL user
+/// limited to `<config>:*`: any command on another key fails with NOPERM.
+#[test]
+fn test_binary_redis_vector_only_stays_inside_its_key_prefix() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let name = "redis-acl-vec";
+    redis::cmd("ACL")
+        .arg(
+            &[
+                "SETUSER",
+                "vdbb-acl-vec",
+                "reset",
+                "on",
+                ">acl-pw",
+                &format!("~{name}:*"),
+                "+@all",
+            ][..],
+        )
+        .query::<()>(&mut conn)
+        .unwrap();
+    let configs = serde_json::json!([{
+        "name": name, "engine": "redis",
+        "search_params": [{"parallel": 1, "top": 10}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    redis::cmd("ACL")
+        .arg(&["LOG", "RESET"][..])
+        .query::<()>(&mut conn)
+        .unwrap();
+    let proj = common::write_match_any_project("acl-vec-test", &configs.to_string(), 8);
+    let port = test_port().to_string();
+    let out = common::run_binary_output(
+        &proj.root,
+        name,
+        "acl-vec-test",
+        TEST_HOST,
+        &[
+            ("REDIS_PORT", port.as_str()),
+            ("REDIS_USER", "vdbb-acl-vec"),
+            ("REDIS_AUTH", "acl-pw"),
+        ],
+        &["--exit-on-error"],
+    );
+    // Denials the run swallowed (teardown ignores errors) still land in the
+    // ACL log: there must be none for this user.
+    let log: redis::Value = redis::cmd("ACL")
+        .arg(&["LOG", "128"][..])
+        .query(&mut conn)
+        .unwrap();
+    let denied = format!("{log:?}").contains("vdbb-acl-vec");
+    let _ = redis::cmd("ACL")
+        .arg(&["DELUSER", "vdbb-acl-vec"][..])
+        .query::<()>(&mut conn);
+    assert!(
+        !denied,
+        "a command outside the config's key prefix was denied: {log:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "vector-only run under a prefix ACL: {stderr}"
+    );
+    assert!(!stderr.contains("NOPERM"), "{stderr}");
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #358 review 5: under an ACL user limited to the config's key prefix (no
+/// access to `vdbb:fulltext-profile:*`), an english fulltext config still runs
+/// and records `index_marker: null`, while a parity config is refused with an
+/// error naming the key pattern it needs.
+#[test]
+fn test_binary_redis_fulltext_marker_under_a_prefix_acl() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let name = "redis-acl-ft";
+    redis::cmd("ACL")
+        .arg(
+            &[
+                "SETUSER",
+                "vdbb-acl-ft",
+                "reset",
+                "on",
+                ">acl-pw",
+                &format!("~{name}:*"),
+                "+@all",
+            ][..],
+        )
+        .query::<()>(&mut conn)
+        .unwrap();
+    let proj = common::write_bm25_project("[]");
+    let write_config = |search_params: serde_json::Value| {
+        fs::write(
+            proj.root.join("experiments/configurations/test.json"),
+            serde_json::json!([{"name": name, "engine": "redis",
+                "upload_params": {"parallel": 1}, "search_params": search_params}])
+            .to_string(),
+        )
+        .unwrap();
+    };
+    let port = test_port().to_string();
+    let envs = [
+        ("REDIS_PORT", port.as_str()),
+        ("REDIS_USER", "vdbb-acl-ft"),
+        ("REDIS_AUTH", "acl-pw"),
+    ];
+    let run = || {
+        common::run_binary_output(
+            &proj.root,
+            name,
+            common::BM25_DATASET,
+            TEST_HOST,
+            &envs,
+            &["--exit-on-error"],
+        )
+    };
+    write_config(
+        serde_json::json!([{"parallel": 1, "top": 5, "workload": "fulltext",
+        "fulltext": {"fields": {"title": 1.0, "segment": 1.0}}}]),
+    );
+    let english = run();
+    write_config(common::bm25_parity_search_params());
+    let parity = run();
+    let _ = redis::cmd("ACL")
+        .arg(&["DELUSER", "vdbb-acl-ft"][..])
+        .query::<()>(&mut conn);
+    let stderr = String::from_utf8_lossy(&english.stderr);
+    assert!(
+        english.status.success(),
+        "english under a prefix ACL: {stderr}"
+    );
+    assert!(stderr.contains("records index_marker: null"), "{stderr}");
+    let doc = common::read_result_doc(&proj.root, name);
+    assert_eq!(doc["params"]["fulltext"]["analysis"], "english");
+    assert!(
+        doc["params"]["fulltext"]["index_marker"].is_null(),
+        "{}",
+        doc["params"]["fulltext"]["index_marker"]
+    );
+    let stderr = String::from_utf8_lossy(&parity.stderr);
+    assert!(!parity.status.success(), "parity must refuse: {stderr}");
+    assert!(stderr.contains("'vdbb:fulltext-profile:*'"), "{stderr}");
+    // Refused when the marker cannot be written (configure), before any upload.
+    let stdout = String::from_utf8_lossy(&parity.stdout);
+    assert!(!stdout.contains("Experiment stage: Upload"), "{stdout}");
     flush_db(&mut conn);
     fs::remove_dir_all(&proj.root).ok();
 }

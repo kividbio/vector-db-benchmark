@@ -468,7 +468,13 @@ claims — e.g. an index built by a vector-only config and reused with
 - RediSearch does not split tokens on `\n`/`\r` (only on its ASCII separator
   set, space and tab). MS MARCO `headings` are newline-joined — 180,249 of the
   299,892 text fields of the 100K corpus contain a newline — so Redis indexes a
-  merged token at every heading boundary that OpenSearch splits.
+  merged token at every heading boundary that OpenSearch splits. Parity
+  normalizes all such whitespace at upload.
+- RediSearch does not split on non-ASCII punctuation either (– — … “ ” • ·
+  stay inside the token); `standard` does. 49% of the 100K `segment` values
+  contain some, led by ’ (32,793 rows; kept between letters by both), “ ”
+  (~12,000 each), – (10,206), — (6,231) and … (3,397). Neither mode normalizes
+  punctuation, so this difference remains in parity too.
 - RediSearch splits on `.`, `-`, `'` inside words; `standard` keeps `u.s.a` and
   `3.5` whole and strips possessive `'s`.
 - RediSearch indexes a term and its stem and expands a query term to both, so a
@@ -504,6 +510,57 @@ and Lucene's `porter2` output, RediSearch's minimum stem length, and
 `VERBATIM` on the query side — so they do not say which of these mechanisms
 accounts for the gap. Treat the as-shipped overlap as the agreement of two
 default English pipelines, not as a BM25 implementation difference.
+
+#### Two analysis modes: `english` (headline) and `parity` (agreement check)
+
+`fulltext.analysis` selects how both engines analyze text:
+
+| | `english` (default) | `parity` |
+|---|---|---|
+| stemming | Porter2 on both, as pinned above | none: Redis `NOSTEM` + `VERBATIM` queries; OpenSearch `vdbb_english_nostem` (the english analyzer without porter2: same tokenizer, possessive, lowercase, stop list) |
+| text fields indexed | every schema `text` field | exactly the searched `fields` (OpenSearch maps the others `index: false`; Redis leaves them out of the schema), so BM25STD's whole-document statistics cover only those |
+| uploaded text | as is | every Unicode whitespace character other than U+0020 (`\n`, `\r`, `\t`, `\x0B`, `\x0C`, U+0085, U+00A0, U+2028, U+2029, …) → space in the indexed text fields, on both engines. RediSearch splits tokens only on space and tab, OpenSearch on all of them. In the 100K corpus `segment` carries `\n` (80,288 rows), U+00A0 (210 rows), `\t` (165), `\x0B` (4), U+2028 (3), U+0085 (3) and `\x0C` (2) |
+| use | headline numbers | agreement check against OpenSearch as source of truth |
+
+```json
+{"parallel": 1, "top": 10, "workload": "fulltext",
+ "fulltext": {"analysis": "parity", "fields": {"segment": 1.0}}}
+```
+
+Report the **english** run as the headline: it is what each engine does with
+its default English pipeline. Report **parity** next to it to show how closely
+Redis matches OpenSearch once the known pipeline differences are removed. On
+the 100K MS MARCO corpus, segment-only parity agrees on about 94% of the top 10
+(see below). `experiments/configurations/redis-msmarco-fulltext.json` and
+`opensearch-msmarco-fulltext.json` ship both modes as separate engine configs,
+so they run side by side:
+
+```bash
+# One run per engine, each into its own (new) dump directory.
+vector-db-benchmark --engines 'redis-msmarco-fulltext-*' \
+  --datasets msmarco-cohere-1024-100K-cosine --dump-results dumps/redis
+vector-db-benchmark --engines 'opensearch-msmarco-fulltext-*' \
+  --datasets msmarco-cohere-1024-100K-cosine --dump-results dumps/opensearch
+vector-db-benchmark compare-results dumps/opensearch dumps/redis --reference opensearch
+```
+
+Parity changes the uploaded corpus, so it is guarded:
+
+- **Startup rules.** Refused before anything is downloaded or connected:
+  - an engine config whose fulltext configs mix `english` and `parity` (they need different indexes);
+  - parity without explicit `fields`;
+  - parity configs searching different field sets;
+  - parity in the same engine config as any `vector`, `hybrid` or `filter-only` config. Normalization and the reduced text index never apply to other workloads.
+- **Redis shared corpus.** On Redis, parity also refuses a shared corpus (`REDIS_KEY_PREFIX`).
+- **Recorded in the index.** The mode is written into the index: a Redis key `vdbb:fulltext-profile:<index>`, and OpenSearch `mappings._meta.vdbb_fulltext` (`{"analysis", "normalize_whitespace", "text_fields"}`).
+- **Marker access on Redis.** The marker key lives outside the config's key prefix.
+  - In english mode, a denied marker write or read (e.g. NOPERM for an ACL user limited to `~<config>:*`) is a printed note, and the result records `index_marker: null`.
+  - In parity mode it is a hard error: the marker is what proves the normalization, so the user needs access to `vdbb:fulltext-profile:*`.
+  - Vector-only configs never touch the marker key.
+- **Verified on `--skip-upload` reuse,** together with the analyzer / `NOSTEM` / indexed-field checks:
+  - an index uploaded without normalization (english, or built before markers existed) is refused in parity;
+  - a parity index is refused in english.
+- **In the result.** `params.fulltext` records `analysis`, `normalize_whitespace`, `indexed_text_fields`, `index_marker` (the marker the live index actually carries, `null` when it has none) next to `index_marker_expected`, and the `known_differences` that remain in that mode.
 
 Result JSON: `params.workload: "fulltext"` and `params.fulltext` (fields and
 boosts, query-term method, stopword list and provenance, the engine's analyzer /
