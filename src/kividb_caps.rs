@@ -10,6 +10,8 @@
 //! [`TagSemantics`]), so a scalar keyword value containing a comma would stop
 //! matching itself.
 
+use std::collections::BTreeMap;
+
 /// The `major.minor.patch` core of a KiviDB version.
 pub type VersionCore = (u32, u32, u32);
 
@@ -98,6 +100,112 @@ impl KividbServer {
                  `major.minor.patch[-pre][+build]` version"
             ),
             (Some(raw), Some(_)) => format!("`INFO server` reported `kividb_version:{raw}`"),
+        }
+    }
+}
+
+/// The `SEPARATOR` each TAG attribute of an index reports in `FT.INFO`, by
+/// attribute name (`None`: a TAG attribute that reports no `SEPARATOR`).
+///
+/// KiviDB >= 1.0.5 lists `attributes` as flat `identifier, …, attribute, …,
+/// type, TAG, SEPARATOR, …` arrays and reports a bare TAG as `SEPARATOR ,`
+/// (measured). KiviDB 1.0.2 has no `attributes` section at all: `Ok(None)`.
+pub fn ft_info_tag_separators(
+    info: &redis::Value,
+) -> Result<Option<BTreeMap<String, Option<String>>>, String> {
+    use crate::indexing_wait::{ft_info_pairs, value_text};
+    let Some((_, attributes)) = ft_info_pairs(info)?
+        .into_iter()
+        .find(|(k, _)| k == "attributes")
+    else {
+        return Ok(None);
+    };
+    let redis::Value::Array(attributes) = attributes else {
+        return Err(format!(
+            "FT.INFO `attributes` is not an array: {attributes:?}"
+        ));
+    };
+    let mut out = BTreeMap::new();
+    for attr in attributes {
+        let mut name = None;
+        let mut is_tag = false;
+        let mut separator = None;
+        for (k, v) in ft_info_pairs(attr)? {
+            match k.as_str() {
+                "attribute" => name = value_text(v),
+                "identifier" if name.is_none() => name = value_text(v),
+                "type" => is_tag = value_text(v).as_deref() == Some("TAG"),
+                "SEPARATOR" => separator = value_text(v),
+                _ => {}
+            }
+        }
+        if is_tag {
+            let name =
+                name.ok_or_else(|| format!("FT.INFO TAG attribute without a name: {attr:?}"))?;
+            out.insert(name, separator);
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Check that an EXISTING index declares every TAG field in `tag_fields` the
+/// way a server with `tags` semantics requires.
+///
+/// This is what makes `--skip-upload` safe to reuse an index built elsewhere:
+/// on KiviDB >= 1.0.5 an index built bare (by a binary predating this check,
+/// whose scalar TAGs were bare, or by hand) reports `SEPARATOR ,`, splits every
+/// stored `Smith, John`, and would publish a recall for filters that matched
+/// the wrong documents. Before 1.0.5 there is nothing to check (no `SEPARATOR`
+/// can be declared, and `FT.INFO` reports no attributes), so `Atomic` passes.
+pub fn check_index_tag_separators(
+    index: &str,
+    separators: Option<&BTreeMap<String, Option<String>>>,
+    tag_fields: &[String],
+    tags: Option<TagSemantics>,
+) -> Result<(), String> {
+    if tag_fields.is_empty() {
+        return Ok(());
+    }
+    let rebuild = "Re-run without `--skip-upload` so `configure()` rebuilds the index with \
+                   `TAG SEPARATOR ;`.";
+    match tags {
+        Some(TagSemantics::Atomic) => Ok(()),
+        None => Err(format!(
+            "KiviDB: cannot verify the TAG declarations of index `{index}`: the server's \
+             version, and so its TAG semantics, are unknown"
+        )),
+        Some(TagSemantics::Separator) => {
+            let Some(separators) = separators else {
+                return Err(format!(
+                    "KiviDB: `FT.INFO {index}` reports no `attributes`, so the TAG \
+                     declarations of a >= 1.0.5 server's index cannot be verified. {rebuild}"
+                ));
+            };
+            for field in tag_fields {
+                match separators.get(field) {
+                    Some(Some(sep)) if sep == ";" => {}
+                    Some(sep) => {
+                        let sep = sep
+                            .as_deref()
+                            .map_or("none".to_string(), |s| format!("{s:?}"));
+                        return Err(format!(
+                            "KiviDB: index `{index}` declares TAG field `{field}` with \
+                             SEPARATOR {sep}, not \";\". On KiviDB >= 1.0.5 that splits a \
+                             stored value such as `Smith, John` into `Smith` + `John`, so a \
+                             filter on the whole value under-matches and a filter on a fragment \
+                             over-matches. {rebuild}"
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "KiviDB: index `{index}` has no TAG field `{field}` (FT.INFO \
+                             attributes: {:?}). {rebuild}",
+                            separators.keys().collect::<Vec<_>>()
+                        ));
+                    }
+                }
+            }
+            Ok(())
         }
     }
 }
@@ -234,6 +342,106 @@ mod tests {
         ] {
             assert_eq!(semantics(v), Some(want), "kividb_version:{v}");
         }
+    }
+
+    fn bulk(s: &str) -> redis::Value {
+        redis::Value::BulkString(s.as_bytes().to_vec())
+    }
+
+    /// The RESP2 `FT.INFO` shape KiviDB 1.0.5 returns (measured), with one
+    /// TAG attribute per `(name, SEPARATOR)` and one NUMERIC.
+    fn ft_info_105(tags: &[(&str, &str)]) -> redis::Value {
+        let mut attrs: Vec<redis::Value> = tags
+            .iter()
+            .map(|(n, sep)| {
+                redis::Value::Array(
+                    [
+                        "identifier",
+                        n,
+                        "attribute",
+                        n,
+                        "type",
+                        "TAG",
+                        "SEPARATOR",
+                        sep,
+                    ]
+                    .iter()
+                    .map(|s| bulk(s))
+                    .collect(),
+                )
+            })
+            .collect();
+        attrs.push(redis::Value::Array(
+            ["identifier", "n", "attribute", "n", "type", "NUMERIC"]
+                .iter()
+                .map(|s| bulk(s))
+                .collect(),
+        ));
+        redis::Value::Array(vec![
+            bulk("index_name"),
+            bulk("idx:x"),
+            bulk("attributes"),
+            redis::Value::Array(attrs),
+            bulk("num_docs"),
+            bulk("0"),
+        ])
+    }
+
+    fn check(
+        info: &redis::Value,
+        fields: &[&str],
+        tags: Option<TagSemantics>,
+    ) -> Result<(), String> {
+        let seps = ft_info_tag_separators(info).unwrap();
+        let fields: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
+        check_index_tag_separators("idx:x", seps.as_ref(), &fields, tags)
+    }
+
+    #[test]
+    fn reads_tag_separators_from_ft_info() {
+        let seps = ft_info_tag_separators(&ft_info_105(&[("s", ","), ("t", ";")]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(seps.get("s"), Some(&Some(",".to_string())));
+        assert_eq!(seps.get("t"), Some(&Some(";".to_string())));
+        assert!(!seps.contains_key("n"), "NUMERIC is not a TAG");
+        // KiviDB 1.0.2 reports no attributes at all.
+        let v102 = redis::Value::Array(vec![
+            bulk("index_name"),
+            bulk("idx:x"),
+            bulk("num_fields"),
+            bulk("1"),
+        ]);
+        assert_eq!(ft_info_tag_separators(&v102).unwrap(), None);
+    }
+
+    /// #375 review, optional item 2: `--skip-upload` must refuse an index whose
+    /// TAG fields a >= 1.0.5 server splits on `,` (built bare, e.g. by a binary
+    /// predating this check).
+    #[test]
+    fn existing_index_must_declare_semicolon_on_separator_servers() {
+        use TagSemantics::*;
+        let good = ft_info_105(&[("s", ";"), ("labels", ";")]);
+        check(&good, &["s", "labels"], Some(Separator)).unwrap();
+        let stale = ft_info_105(&[("s", ","), ("labels", ";")]);
+        let err = check(&stale, &["s", "labels"], Some(Separator)).unwrap_err();
+        assert!(
+            err.contains("`s`") && err.contains("SEPARATOR \",\""),
+            "{err}"
+        );
+        let err = check(&good, &["s", "missing"], Some(Separator)).unwrap_err();
+        assert!(err.contains("no TAG field `missing`"), "{err}");
+        let v102 = redis::Value::Array(vec![bulk("index_name"), bulk("idx:x")]);
+        assert!(
+            check(&v102, &["s"], Some(Separator)).is_err(),
+            "unverifiable on >= 1.0.5"
+        );
+        // Before 1.0.5 nothing can be declared, so nothing is checked.
+        check(&v102, &["s"], Some(Atomic)).unwrap();
+        check(&stale, &["s"], Some(Atomic)).unwrap();
+        assert!(check(&good, &["s"], None).is_err());
+        // No TAG field: nothing to check, whatever the server.
+        check(&v102, &[], None).unwrap();
     }
 
     #[test]

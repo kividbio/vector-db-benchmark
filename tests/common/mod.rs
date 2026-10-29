@@ -1909,6 +1909,18 @@ pub fn run_binary_capture(
     host: &str,
     envs: &[(&str, &str)],
 ) -> BinaryRun {
+    run_binary_capture_extra(root, engine, dataset, host, envs, &[])
+}
+
+/// [`run_binary_capture`] with extra CLI args (e.g. `--skip-upload`).
+pub fn run_binary_capture_extra(
+    root: &Path,
+    engine: &str,
+    dataset: &str,
+    host: &str,
+    envs: &[(&str, &str)],
+    extra: &[&str],
+) -> BinaryRun {
     let mut cmd = std::process::Command::new(binary_path());
     cmd.args([
         "--engines",
@@ -1920,6 +1932,7 @@ pub fn run_binary_capture(
         "--skip-if-exists",
         "false",
     ])
+    .args(extra)
     .current_dir(root);
     for (k, v) in envs {
         cmd.env(k, v);

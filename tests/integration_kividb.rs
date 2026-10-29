@@ -687,6 +687,126 @@ fn test_binary_kividb_keyword_value_with_comma() {
     );
 }
 
+/// `--skip-upload` must not measure a reused index whose TAG fields the server
+/// splits on `,`. On KiviDB >= 1.0.5 a bare TAG reports `SEPARATOR ,`; an index
+/// built that way (by a binary predating #375, which declared scalar TAGs bare,
+/// or by hand) under-matches every comma-bearing value. Phase 1 uploads the
+/// comma fixture and keeps it; the index is then rebuilt over the same keys,
+/// first bare (must be refused, naming the field) and then `SEPARATOR ;` (must
+/// run at full recall: the positive control that the check is not a blanket
+/// refusal and that the rebuilt index really covers the kept corpus).
+///
+/// Before 1.0.5 no `SEPARATOR` can be declared, so there is no stale shape to
+/// build and nothing to check; the legacy run skips the body.
+#[test]
+fn test_kividb_skip_upload_refuses_a_stale_bare_tag_index() {
+    wait_for_kividb();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    if assert_server_tag_semantics(&mut conn) == TagSemantics::Atomic {
+        println!("pre-1.0.5 server: no SEPARATOR to get wrong, nothing to check");
+        return;
+    }
+
+    let name = "kividb-stale";
+    let configs = serde_json::json!([{
+        "name": name, "engine": "kividb", "algorithm": "hnsw",
+        "collection_params": { "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 128 } },
+        "search_params": [{ "parallel": 1, "search_params": { "ef": 256 } }],
+        "upload_params": { "parallel": 1, "batch_size": 64 }
+    }]);
+    let dim = 8;
+    let proj = common::write_comma_keyword_project("kividb-stale-test", &configs.to_string(), dim);
+    let port = test_port().to_string();
+    let envs = [("KIVIDB_PORT", port.as_str())];
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            name,
+            "kividb-stale-test",
+            TEST_HOST,
+            &envs,
+            &["--keep-data"]
+        ),
+        "phase 1 (upload, keep data) failed"
+    );
+
+    let index = format!("idx:{name}");
+    let rebuild = |conn: &mut Connection, tag: &[&str]| {
+        let _: () = redis::cmd("FT.DROPINDEX").arg(&index).query(conn).unwrap();
+        let mut cmd = redis::cmd("FT.CREATE");
+        cmd.arg(&index)
+            .arg("ON")
+            .arg("HASH")
+            .arg("PREFIX")
+            .arg("1")
+            .arg(format!("{name}:"))
+            .arg("SCHEMA")
+            .arg("vector")
+            .arg("VECTOR")
+            .arg("HNSW")
+            .arg(10)
+            .arg("TYPE")
+            .arg("FLOAT32")
+            .arg("DIM")
+            .arg(dim)
+            .arg("DISTANCE_METRIC")
+            .arg("L2")
+            .arg("M")
+            .arg(16)
+            .arg("EF_CONSTRUCTION")
+            .arg(128)
+            .arg("author");
+        for a in tag {
+            cmd.arg(*a);
+        }
+        let _: () = cmd.query(conn).unwrap();
+    };
+
+    rebuild(&mut conn, &["TAG"]);
+    delete_search_result_files(&proj.root);
+    let run = common::run_binary_capture_extra(
+        &proj.root,
+        name,
+        "kividb-stale-test",
+        TEST_HOST,
+        &envs,
+        &["--skip-upload", "--keep-data"],
+    );
+    assert!(
+        !run.ok,
+        "a bare-TAG index on a >= 1.0.5 server must be refused"
+    );
+    assert!(
+        run.combined
+            .contains("declares TAG field `author` with SEPARATOR \",\""),
+        "refused for the wrong reason:\n{}",
+        run.combined
+    );
+    let searches: Vec<_> = fs::read_dir(proj.root.join("results"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("-search-"))
+        .collect();
+    assert!(searches.is_empty(), "refused run wrote {searches:?}");
+
+    rebuild(&mut conn, &["TAG", "SEPARATOR", ";"]);
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            name,
+            "kividb-stale-test",
+            TEST_HOST,
+            &envs,
+            &["--skip-upload"]
+        ),
+        "a SEPARATOR ; index over the kept corpus must be accepted"
+    );
+    let recall = common::read_recall(&proj.root, name);
+    assert!(recall >= 0.9, "rebuilt-index recall {recall:.3} < 0.9");
+}
+
 /// A `"algorithm":"flat"` config must run end-to-end: EF_RUNTIME is HNSW-only,
 /// so the engine must NOT emit it (or bind the EF param) for a FLAT index — else
 /// every FT.SEARCH is a syntax error and the run fails with "No searches

@@ -203,7 +203,7 @@ impl FtInfoProgress {
     }
 }
 
-fn value_text(v: &redis::Value) -> Option<String> {
+pub(crate) fn value_text(v: &redis::Value) -> Option<String> {
     match v {
         redis::Value::BulkString(b) => Some(String::from_utf8_lossy(b).into_owned()),
         redis::Value::SimpleString(s) => Some(s.clone()),
@@ -239,7 +239,7 @@ pub fn parse_ft_info(info: &redis::Value) -> Result<FtInfoProgress, String> {
 }
 
 /// Top-level (field, value) pairs of an `FT.INFO` reply, RESP2 or RESP3.
-fn ft_info_pairs(info: &redis::Value) -> Result<Vec<(String, &redis::Value)>, String> {
+pub(crate) fn ft_info_pairs(info: &redis::Value) -> Result<Vec<(String, &redis::Value)>, String> {
     match info {
         redis::Value::Array(a) => Ok(a
             .chunks(2)

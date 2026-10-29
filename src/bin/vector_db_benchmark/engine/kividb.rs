@@ -73,7 +73,9 @@ use crate::dataset::Dataset;
 use crate::engine::index_naming::{derive_index_name, derive_key_prefix};
 use crate::engine::{CorpusCount, Engine, SearchResults, UploadStats};
 use crate::metrics::compute_metrics;
-use vector_db_benchmark::kividb_caps::{KividbServer, TagSemantics};
+use vector_db_benchmark::kividb_caps::{
+    check_index_tag_separators, ft_info_tag_separators, KividbServer, TagSemantics,
+};
 use vector_db_benchmark::parsers::{datetime_to_epoch_secs, doc_key_to_id, doc_key_to_id_opt};
 use vector_db_benchmark::readers::metadata::{is_multivalued_keyword_field, MetadataItem};
 use vector_db_benchmark::start_gate::WorkerPool;
@@ -1711,6 +1713,22 @@ fn tag_declaration(
     }
 }
 
+/// The schema fields `create_index` declares as TAG (`keyword`, `uuid`, `bool`).
+fn tag_field_names(dataset: &Dataset) -> Vec<String> {
+    dataset
+        .config
+        .schema
+        .as_ref()
+        .and_then(|s| s.as_object())
+        .map(|o| {
+            o.iter()
+                .filter(|(_, t)| matches!(t.as_str(), Some("keyword" | "uuid" | "bool")))
+                .map(|(k, _)| k.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Reject, with no server round trip, the dataset schema shapes NO KiviDB
 /// version can index: a `geo` field (KiviDB's index schema has no GEO type).
 ///
@@ -2235,14 +2253,32 @@ impl Engine for KividbEngine {
 
         // Schema validation, repeated for the `--skip-upload` path, which
         // reaches `search()` without ever calling `configure()` (one INFO round
-        // trip), then the index-existence guard: on that path a missing or
+        // trip); the index-existence guard: on that path a missing or
         // mismatched index would otherwise write a silent recall-0.0 result
-        // file. Both run before the queries are read, outside every timed window.
+        // file; and the index's TAG declarations as the SERVER reports them
+        // (FT.INFO), so a reused index built bare on a >= 1.0.5 server (it
+        // splits on `,`) is refused rather than measured. All run before the
+        // queries are read, outside every timed window.
         {
             let mut conn = self.get_connection()?;
             let server = Self::server_identity(&mut conn)?;
             validate_dataset_support(dataset, &server)?;
             redis_utils::ensure_index_exists(&mut conn, &self.config.index_name)?;
+            let tag_fields = tag_field_names(dataset);
+            if !tag_fields.is_empty() {
+                let info: redis::Value = redis::cmd("FT.INFO")
+                    .arg(&self.config.index_name)
+                    .query(&mut conn)
+                    .map_err(|e| {
+                        format!("KiviDB: FT.INFO {} failed: {e}", self.config.index_name)
+                    })?;
+                check_index_tag_separators(
+                    &self.config.index_name,
+                    ft_info_tag_separators(&info)?.as_ref(),
+                    &tag_fields,
+                    server.tag_semantics(),
+                )?;
+            }
         }
 
         let ef = params
