@@ -97,6 +97,8 @@ src/
   fulltext.rs         # ranked BM25 workload: query terms, pinned analyzers, index checks (#339)
   compare_results.rs  # compare-results: overlap/Jaccard/rank/count vs a reference
   start_gate.rs       # Worker barrier for parallel search
+  build_info.rs       # commit the binaries were built from: `--version`, `params.build`
+                      #   (resolved by build.rs via build_info/resolve.rs, #366)
   config.rs, redis_client.rs, parsers.rs
   bin/
     vector_db_benchmark/
@@ -110,6 +112,26 @@ tests/                # integration_<engine>.rs, plus harness_invariants +
 datasets/datasets.json        # Dataset registry
 experiments/configurations/   # Engine configs (HNSW params, search params)
 ```
+
+## Cutting a release (prebuilt binaries, #366)
+
+`.github/workflows/release-binaries.yml` attaches `vector-db-benchmark-<tag>-{linux-x86_64,linux-aarch64,macos-aarch64}.tar.gz`
+and `SHA256SUMS` to a published release. Its `plan` job runs `check_release_tag`
+(`scripts/release/lib.sh`) first. That check refuses a tag that does not name
+`Cargo.toml`'s `[package].version` (`X.Y.Z`, `vX.Y.Z` or `X.Y.Z-rc.N`), and any
+tag containing `+`.
+
+So: **bump the version, merge, then tag that commit and publish the release.**
+A release published without the bump gets no archives, but still becomes
+"latest", which breaks the README's install one-liner until it is fixed.
+
+If `publish` or the check after it fails, use **Re-run failed jobs** on that
+run. It reuses the same build artifacts, and `publish.sh` completes the upload,
+replacing any upload that never finished. **Re-run all jobs** rebuilds, so the
+digests differ and the run refuses. Rebuild a tag on purpose only with
+`workflow_dispatch` (`tag` plus `clobber: true`, which replaces the whole set). Everything except the upload also runs on PRs that
+touch the archive's inputs: `make release-selftest` and
+`scripts/release/install-test.sh` run there.
 
 ## Dataset Formats
 

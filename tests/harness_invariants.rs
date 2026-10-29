@@ -1638,3 +1638,138 @@ fn every_repo_path_named_in_the_agent_docs_exists() {
         }
     }
 }
+
+/// INV-A4 (#366): the release-archive workflow builds through the Makefile and
+/// the scripts its PR check runs, and its PR trigger covers every input of the
+/// archive. The PR run is the only time the archive path executes before a
+/// release depends on it, so a filter that misses an input (say `build.rs`,
+/// which decides the commit every binary reports) lets a change ship that no
+/// PR ever built.
+#[test]
+fn release_workflow_is_the_make_targets_and_its_pr_filter_covers_the_inputs() {
+    let wf = repo_file(".github/workflows/release-binaries.yml");
+    for needed in [
+        "make release-archive",
+        "make release-checksums",
+        "make release-selftest",
+        "scripts/release/verify.sh",
+        "scripts/release/publish.sh",
+        "scripts/release/tls-probe.sh",
+        "scripts/install-release.sh",
+        "scripts/release/install-test.sh",
+        "check_release_tag",
+        "ubuntu:22.04",
+        "amazonlinux:2023",
+        "RELEASE_RUST_TOOLCHAIN",
+    ] {
+        assert!(
+            wf.contains(needed),
+            "release-binaries.yml no longer uses `{needed}`"
+        );
+    }
+    // The upload decisions (refuse / resume / clobber) live in publish.sh, where
+    // the self-test reaches them; an inline `gh release upload` would not be.
+    assert!(
+        !wf.contains("gh release upload") && !wf.contains("--clobber"),
+        "release-binaries.yml uploads assets inline; go through scripts/release/publish.sh"
+    );
+    for line in wf.lines() {
+        let line = line.trim();
+        assert!(
+            !(line.starts_with("run:") && line.contains("cargo build")),
+            "release-binaries.yml runs `cargo build` directly:\n    {line}\n\
+             Package through `make release-archive`, so a PR builds what a release ships."
+        );
+    }
+    // The archive is built from the tag's lockfile, never a re-resolve.
+    let package = repo_file("scripts/release/package.sh");
+    assert!(
+        package
+            .lines()
+            .any(|l| l.trim_start().starts_with("cargo build") && l.contains("--locked")),
+        "scripts/release/package.sh must build with --locked"
+    );
+
+    let pr = wf
+        .split_once("  pull_request:")
+        .expect("release-binaries.yml must run on pull_request")
+        .1
+        .split_once("\npermissions:")
+        .expect("the pull_request block must precede `permissions:`")
+        .0;
+    for input in [
+        "'Cargo.toml'",
+        "'Cargo.lock'",
+        "'build.rs'",
+        "'src/**'",
+        "'Makefile'",
+        "'LICENSE'",
+        "'README.md'",
+        "'scripts/release/**'",
+        "'scripts/install-release.sh'",
+        "'datasets/datasets.json'",
+        "'datasets/random-100/**'",
+        "'experiments/configurations/**'",
+        "'.github/workflows/release-binaries.yml'",
+    ] {
+        assert!(
+            pr.contains(input),
+            "release-binaries.yml's pull_request paths miss {input}, an input of the archives"
+        );
+    }
+
+    // ci.yml runs this test, so it must rerun on everything the test reads:
+    // build.rs (compiled into every test binary) and the files below.
+    let ci = repo_file(".github/workflows/ci.yml");
+    for input in [
+        "- 'build.rs'",
+        "- '.github/workflows/release-binaries.yml'",
+        "- '.github/workflows/docker-build-pr.yml'",
+        "- '.github/workflows/docker-publish-master.yml'",
+        "- '.github/workflows/docker-publish-release.yml'",
+        "- 'scripts/release/**'",
+    ] {
+        assert_eq!(
+            ci.matches(input).count(),
+            2,
+            "ci.yml's push and pull_request paths must both list {input}"
+        );
+    }
+
+    // The Docker PR build compiles build.rs and must name the commit it built.
+    let docker_pr = repo_file(".github/workflows/docker-build-pr.yml");
+    assert!(
+        docker_pr.contains("- 'build.rs'"),
+        "docker-build-pr.yml's paths must list build.rs"
+    );
+    assert!(
+        docker_pr.contains("VDB_BUILD_GIT_SHA=${{ github.sha }}")
+            && docker_pr.contains("--version"),
+        "docker-build-pr.yml must build with VDB_BUILD_GIT_SHA and check --version names it"
+    );
+
+    // The published images name their commit too (the Docker build context
+    // has no `.git`, so without the build-arg they would report "unknown").
+    for wf_name in ["docker-publish-master.yml", "docker-publish-release.yml"] {
+        let wf = repo_file(&format!(".github/workflows/{wf_name}"));
+        assert!(
+            wf.contains("VDB_BUILD_GIT_SHA=${{ github.sha }}"),
+            "{wf_name} must build with VDB_BUILD_GIT_SHA=${{{{ github.sha }}}}"
+        );
+    }
+
+    // The dirty-tree scope is one list in two languages: what build.rs reports
+    // as "dirty tree" and what package.sh refuses to package must agree.
+    let build_rs = repo_file("build.rs");
+    assert!(
+        build_rs.contains(
+            r#"const COMPILED_INPUTS: [&str; 4] = ["build.rs", "src", "Cargo.toml", "Cargo.lock"];"#
+        ),
+        "build.rs COMPILED_INPUTS changed: update scripts/release/lib.sh to match, then this test"
+    );
+    assert!(
+        repo_file("scripts/release/lib.sh")
+            .contains("COMPILED_INPUTS=(build.rs src Cargo.toml Cargo.lock)"),
+        "scripts/release/lib.sh COMPILED_INPUTS must equal build.rs's"
+    );
+}
