@@ -279,9 +279,10 @@ impl KividbEngine {
         // keyword/uuid/bool exact strings -> TAG; int/float/datetime (stored as
         // epoch) -> NUMERIC; full-text -> TEXT.
         //
-        // Two KiviDB-specific departures from the RediSearch schema (both
-        //     verified live against the FT.CREATE parser):
-        //   * The TAG declaration depends on the server version
+        // Two KiviDB-specific points (both verified live against the
+        // FT.CREATE parser):
+        //   * The TAG declaration depends on the server version: redis.rs's
+        //     `TAG SEPARATOR ;` from 1.0.5, a bare (atomic) TAG before it
         //     (`tag_declaration`, measured in `kividb_caps`).
         //   * GEO is never declared: KiviDB's schema (`FieldType`) has no Geo
         //     variant at all, unlike Dragonfly's parser-level rejection of
