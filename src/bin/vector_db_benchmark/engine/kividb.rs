@@ -294,7 +294,7 @@ impl KividbEngine {
         if let Some(schema) = dataset.config.schema.as_ref().and_then(|s| s.as_object()) {
             for (field_name, field_type) in schema {
                 match field_type.as_str().unwrap_or("") {
-                    t @ ("keyword" | "uuid" | "bool") => {
+                    t if is_tag_type(t) => {
                         // `validate_dataset_support` has already rejected every
                         // combination `tag_declaration` refuses; it refuses them
                         // again here so a caller that skips validation errors
@@ -1713,7 +1713,15 @@ fn tag_declaration(
     }
 }
 
-/// The schema fields `create_index` declares as TAG (`keyword`, `uuid`, `bool`).
+/// Whether `create_index` declares a schema field of this type as a TAG. The ONE
+/// definition: `create_index`, `validate_dataset_support` and `tag_field_names`
+/// (which scopes the FT.INFO declaration check in `search()`) all use it, so a
+/// TAG type added to one cannot silently drop out of the others' checks.
+fn is_tag_type(field_type: &str) -> bool {
+    matches!(field_type, "keyword" | "uuid" | "bool")
+}
+
+/// The schema fields `create_index` declares as TAG (see [`is_tag_type`]).
 fn tag_field_names(dataset: &Dataset) -> Vec<String> {
     dataset
         .config
@@ -1722,7 +1730,7 @@ fn tag_field_names(dataset: &Dataset) -> Vec<String> {
         .and_then(|s| s.as_object())
         .map(|o| {
             o.iter()
-                .filter(|(_, t)| matches!(t.as_str(), Some("keyword" | "uuid" | "bool")))
+                .filter(|(_, t)| t.as_str().is_some_and(is_tag_type))
                 .map(|(k, _)| k.clone())
                 .collect()
         })
@@ -1795,7 +1803,7 @@ fn validate_dataset_support(dataset: &Dataset, server: &KividbServer) -> Result<
     let reported = server.describe();
     for (field_name, field_type) in schema {
         let field_type = field_type.as_str().unwrap_or("");
-        if !matches!(field_type, "keyword" | "uuid" | "bool") {
+        if !is_tag_type(field_type) {
             continue;
         }
         match tags {
@@ -2674,6 +2682,21 @@ mod tests {
         );
         assert!(tag_declaration("labels", "keyword", Some(Atomic)).is_err());
         assert!(tag_declaration("labels", "keyword", None).is_err());
+    }
+
+    /// The FT.INFO declaration check in `search()` is scoped by
+    /// `tag_field_names`; it must cover exactly the fields `create_index`
+    /// declares as TAG (#375 review pass 2), or a stale bare index on a field
+    /// it misses would pass `--skip-upload`.
+    #[test]
+    fn tag_field_names_are_exactly_the_tag_typed_fields() {
+        let ds = dataset_with_schema(serde_json::json!({
+            "k": "keyword", "u": "uuid", "b": "bool", "labels": "keyword",
+            "i": "int", "f": "float", "d": "datetime", "t": "text", "g": "geo"
+        }));
+        let mut got = tag_field_names(&ds);
+        got.sort();
+        assert_eq!(got, ["b", "k", "labels", "u"]);
     }
 
     /// #326 review, optional item 4: geo is rejected before `configure()`
