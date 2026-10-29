@@ -669,7 +669,7 @@ fn write_filter_project_multi(
 ///
 /// Guards the TAG declaration, not the filter syntax: an engine whose index
 /// splits a scalar on `,` (a bare RediSearch-style TAG, whose default
-/// separator is `,`, and KiviDB >= 1.0.5's) indexes `Smith, John` as `Smith` +
+/// separator is `,`, as is KiviDB's) indexes `Smith, John` as `Smith` +
 /// `John`, so the even queries match nothing and the odd ones also match every
 /// `Smith, John` document. Either way recall collapses.
 pub fn write_comma_keyword_project(
@@ -2362,7 +2362,7 @@ fn display_id(id: &str) -> &str {
 /// redis:8.8.0 (`db0:keys=1,expires=0,avg_ttl=0,subexpiry=0`), valkey-bundle
 /// (`...,keys_with_volatile_items=0`), dragonfly df-v1.40.1
 /// (`db0:keys=1,expires=0,hits=0,misses=0,hit_ratio=0.00,avg_ttl=-1`) and kividb
-/// v1.0.2-full (`db0:keys=1,expires=0,avg_ttl=0`) — so parse by name. All four
+/// 1.1.2 (`db0:keys=1,expires=0,avg_ttl=0`) — so parse by name. All four
 /// emit the `# Keyspace` header (measured).
 pub fn sum_keyspace_keys(info: &str) -> Option<i64> {
     if !info
@@ -2406,7 +2406,7 @@ pub fn info_field(info: &str, field: &str) -> String {
 /// is not honoured for a different one that later took the port.
 ///
 /// `run_id` from `INFO server` where available (redis:8.8.0, valkey-bundle,
-/// kividb v1.0.2-full), falling back to `master_replid` from `INFO replication`
+/// kividb 1.1.2), falling back to `master_replid` from `INFO replication`
 /// (dragonfly df-v1.40.1 reports no `run_id`; all four checked live). Empty when
 /// neither is present — an empty identity never matches a prior claim.
 ///
@@ -2475,7 +2475,7 @@ pub fn probe_server(host: &str, port: u16, wait: std::time::Duration) -> Probe {
     // still filling, so "0 keys" would be a lie.
     //
     // Best-effort by design: an engine whose `INFO persistence` errors, or that
-    // omits `loading` entirely (kividb v1.0.2-full does — measured), simply gets
+    // omits `loading` entirely (an early kividb release did; 1.1.2 reports it), simply gets
     // no loading check. Making a missing section fatal would refuse those engines
     // outright, and a server so locked down that INFO fails is caught two lines
     // below by `INFO keyspace` anyway.

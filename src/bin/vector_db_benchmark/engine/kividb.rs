@@ -39,10 +39,10 @@
 //!
 //! # RESP2 only
 //!
-//! KiviDB 1.0.2 (the version this engine was written against) did not
-//! implement RESP3; 1.0.5 does. There is no protocol opt-in here, so every
-//! version is served the same way (unlike
-//! dragonfly.rs's `DRAGONFLY_PROTOCOL=resp3`); every connection stays RESP2.
+//! The KiviDB release this engine was first written against did not implement
+//! RESP3; 1.1.2 does (`HELLO 3` succeeds, measured). There is no protocol
+//! opt-in here (unlike dragonfly.rs's `DRAGONFLY_PROTOCOL=resp3`); every
+//! connection stays RESP2, which every KiviDB release speaks.
 //!
 //! # FT.INFO dialect: no `num_docs` / `percent_indexed`
 //!
@@ -74,7 +74,7 @@ use crate::engine::index_naming::{derive_index_name, derive_key_prefix};
 use crate::engine::{CorpusCount, Engine, SearchResults, UploadStats};
 use crate::metrics::compute_metrics;
 use vector_db_benchmark::kividb_caps::{
-    check_index_tag_separators, ft_info_tag_separators, KividbServer, TagSemantics,
+    check_index_tag_separators, ft_info_tag_separators, KividbServer, TAG_MIN_VERSION_STR,
 };
 use vector_db_benchmark::parsers::{datetime_to_epoch_secs, doc_key_to_id, doc_key_to_id_opt};
 use vector_db_benchmark::readers::metadata::{is_multivalued_keyword_field, MetadataItem};
@@ -122,7 +122,7 @@ impl KividbEngine {
     pub fn new(engine_config: &EngineConfig, host: &str) -> Result<Self, String> {
         // KiviDB's own default listen port is 6380, NOT Redis's 6379 (its
         // banner reads `Listening on 0.0.0.0:6380`, and the official
-        // `quay.io/kividbio/kividb` image exposes 6380). Defaulting to 6379
+        // `kividb/kividb` image exposes 6380). Defaulting to 6379
         // meant an out-of-the-box run could not connect at all, or — worse —
         // silently benchmarked a real Redis that happened to be on 6379.
         let port: u16 = crate::effective_config::env_parsed("KIVIDB_PORT", 6380);
@@ -243,7 +243,7 @@ impl KividbEngine {
         &self,
         conn: &mut Connection,
         dataset: &Dataset,
-        tags: Option<TagSemantics>,
+        tags_supported: bool,
     ) -> Result<(), String> {
         let distance = dataset.distance();
         let vector_size = dataset.vector_size();
@@ -283,9 +283,10 @@ impl KividbEngine {
         //
         // Two KiviDB-specific points (both verified live against the
         // FT.CREATE parser):
-        //   * The TAG declaration depends on the server version: redis.rs's
-        //     `TAG SEPARATOR ;` from 1.0.5, a bare (atomic) TAG before it
-        //     (`tag_declaration`, measured in `kividb_caps`).
+        //   * Every TAG is declared redis.rs's `TAG SEPARATOR ;`, on a server
+        //     the tool supports TAG fields on (KiviDB >= 1.1.2, see
+        //     `tag_declaration` and `kividb_caps`); on any other server no
+        //     TAG is declared at all.
         //   * GEO is never declared: KiviDB's schema (`FieldType`) has no Geo
         //     variant at all, unlike Dragonfly's parser-level rejection of
         //     `$param` geo bounds — there is simply nothing to declare here.
@@ -300,7 +301,7 @@ impl KividbEngine {
                         // again here so a caller that skips validation errors
                         // instead of declaring a TAG that matches the wrong docs.
                         cmd.arg(field_name);
-                        for arg in tag_declaration(field_name, t, tags)? {
+                        for arg in tag_declaration(field_name, t, tags_supported)? {
                             cmd.arg(*arg);
                         }
                     }
@@ -513,17 +514,18 @@ impl KividbEngine {
 ///
 /// This deliberately does NOT reuse redis.rs's `parse_conditions`. That builder
 /// is correct for RediSearch/ValkeySearch/Dragonfly and is left untouched; the
-/// list below is what was measured against a real `quay.io/kividbio/kividb:v1.0.2-full`
-/// server and is why KiviDB needs its own emitter. Every item was reproduced by
-/// hand with `FT.SEARCH` against a seeded index before being encoded here.
+/// list below is what was measured against the early KiviDB release this engine
+/// was first written against, and is why KiviDB got its own emitter. Every item
+/// was reproduced by hand with `FT.SEARCH` against a seeded index before being
+/// encoded here.
 ///
-/// Re-measured on KiviDB 1.0.5 (README, "Re-measured on KiviDB 1.0.5"): items
-/// 1-7 and 9 no longer reproduce; 8 (no GEO field type) still does. The emitter
-/// is kept as-is because its literal, minimally-parenthesised output is correct
-/// on every version, including the 1.0.2 servers it was written against. What
-/// DID change on 1.0.5 is the index side: a bare TAG now splits on `,`, so
-/// `create_index` declares every TAG `SEPARATOR ;` there (`tag_declaration`);
-/// a literal `@f:{Smith, John}` from this emitter then matches exactly.
+/// Re-measured on KiviDB 1.1.2 (README, "Re-measured on KiviDB 1.1.2"): items
+/// 1-7 and 9 no longer reproduce, and every probe returns the same count as
+/// RediSearch; 8 (no GEO field type) still does. The emitter is kept as-is
+/// because its literal, minimally-parenthesised output is correct on 1.1.2 as
+/// well. On the index side a bare TAG splits on `,` (as on RediSearch), so
+/// `create_index` declares every TAG `SEPARATOR ;` (`tag_declaration`); a
+/// literal `@f:{Smith, John}` from this emitter then matches exactly.
 ///
 /// 1. **`$param` placeholders are NOT substituted in a filter expression, in
 ///    ANY query form.** This is the root cause of issue #205. The failure is
@@ -945,7 +947,8 @@ pub(crate) mod kividb_filter {
                 "KiviDB filter: multi-term full-text query {trimmed:?} on `{field}` is not \
                  supported — KiviDB's TEXT matcher handles a single term per `@field:(...)` \
                  clause and returns ZERO documents for a multi-term query (verified live on \
-                 v1.0.2), which would be reported as recall 0.0."
+                 an early release; kept as a conservative refusal), which would be reported \
+                 as recall 0.0."
             ));
         }
         if !trimmed.chars().all(|c| c.is_alphanumeric()) {
@@ -1075,7 +1078,8 @@ pub(crate) mod kividb_filter {
     /// The first character in `value` that a KiviDB TAG value cannot represent,
     /// if any.
     ///
-    /// Measured on v1.0.2 by storing `zz<c>zz` and querying it back for 32
+    /// Measured on an early KiviDB release by storing `zz<c>zz` and querying it
+    /// back for 32
     /// candidate characters. FOUR fail to round-trip, and the probe has to be
     /// run in every clause POSITION this builder emits, not just as a lone bare
     /// clause — the first version of this check tested bare clauses only and
@@ -1104,10 +1108,12 @@ pub(crate) mod kividb_filter {
     ///
     /// The obvious worry is the corpus: if a stored value carrying one of these
     /// characters were mis-indexed, no query-side check could see it. Measured
-    /// on v1.0.2, it is not — the whole failure lives in the query parser and a
-    /// stored occurrence is INERT (re-measured on 1.0.5 with the `SEPARATOR ;`
-    /// declaration it gets there: a stored `a|b` / `c@d` / `Bag (Small)` still
-    /// leaves `@t:{a}` / `@t:{c}` at exactly their own document):
+    /// on that release, it is not — the whole failure lives in the query parser
+    /// and a stored occurrence is INERT (re-measured on 1.1.2 with the
+    /// `SEPARATOR ;` declaration: a stored `zz|zz` / `zz@zz` leaves `@t:{zz}` at
+    /// 0 documents, as on RediSearch; and on 1.1.2 the escaped forms of all
+    /// four characters match exactly, bare and grouped, so this refusal is
+    /// conservative there rather than necessary):
     ///
     /// * A stored `a|b` is **not** split on the separator. With documents
     ///   `a|b`, `a` and `b` in one TAG field, `@t:{a}` returns exactly 1 (the
@@ -1651,9 +1657,9 @@ fn upload_batch_internal(
                     MetadataValue::Labels(labels) => {
                         // Stored `;`-joined, as redis.rs does. A DECLARED
                         // multi-valued field only reaches this point on a server
-                        // that splits TAG values on `;` (KiviDB >= 1.0.5);
+                        // that splits TAG values on `;` (KiviDB >= 1.1.2);
                         // `validate_dataset_support` rejects the dataset in
-                        // `configure()` on older servers, before the payload is
+                        // `configure()` on any other server, before the payload is
                         // even read.
                         //
                         // An UNDECLARED labels field was never filterable on any
@@ -1679,37 +1685,29 @@ fn upload_batch_internal(
 }
 
 /// The FT.CREATE arguments that follow a TAG-typed field's name (`keyword`,
-/// `uuid`, `bool`), for a server with TAG semantics `tags` (`None`: version
-/// unknown). Pure, so the declaration each server gets is unit-tested.
+/// `uuid`, `bool`). `tags_supported` is [`KividbServer::tags_supported`]. Pure,
+/// so the declaration each server gets is unit-tested.
 ///
-/// * [`TagSemantics::Separator`] (KiviDB >= 1.0.5): `TAG SEPARATOR ;` for EVERY
-///   TAG field, exactly as redis.rs declares them. A multi-valued `labels` value
-///   is stored `;`-joined and splits into its elements. A scalar must not be
-///   declared bare: from 1.0.5 a bare TAG splits on RediSearch's default `,`, so
-///   a stored `Smith, John` would index as `Smith` + `John` and
-///   `@f:{Smith, John}` would match nothing (measured, see `kividb_caps`).
-/// * [`TagSemantics::Atomic`] (before 1.0.5): `FT.CREATE` rejects `SEPARATOR`
-///   (`ERR unknown field type`) and a bare TAG value is one atomic token, which
-///   is exactly right for a scalar. A multi-valued field has no faithful
-///   declaration (`@f:{b}` never matches a stored `a;b;c`): `Err`.
-/// * `None`: neither declaration is known to be right, so `Err`.
+/// * Supported (KiviDB >= 1.1.2): `TAG SEPARATOR ;` for EVERY TAG field,
+///   exactly as redis.rs declares them. A multi-valued `labels` value is stored
+///   `;`-joined and splits into its elements. A scalar must not be declared
+///   bare: a bare TAG splits on RediSearch's default `,`, so a stored
+///   `Smith, John` would index as `Smith` + `John` and `@f:{Smith}` would
+///   match it (measured on 1.1.2, see `kividb_caps`).
+/// * Otherwise (an older server, or one whose version is unknown): no
+///   declaration is known to be right, so `Err`.
 fn tag_declaration(
     field_name: &str,
     field_type: &str,
-    tags: Option<TagSemantics>,
+    tags_supported: bool,
 ) -> Result<&'static [&'static str], String> {
-    let multivalued = field_type == "keyword" && is_multivalued_keyword_field(field_name);
-    match tags {
-        Some(TagSemantics::Separator) => Ok(&["TAG", "SEPARATOR", ";"]),
-        Some(TagSemantics::Atomic) if !multivalued => Ok(&["TAG"]),
-        Some(TagSemantics::Atomic) => Err(format!(
-            "KiviDB: refusing to declare multi-valued keyword field `{field_name}` on a \
-             server without TAG SEPARATOR support (KiviDB < 1.0.5)"
-        )),
-        None => Err(format!(
+    if tags_supported {
+        Ok(&["TAG", "SEPARATOR", ";"])
+    } else {
+        Err(format!(
             "KiviDB: refusing to declare {field_type} field `{field_name}` as a TAG on a \
-             server whose version is unknown"
-        )),
+             server whose version is unknown or older than {TAG_MIN_VERSION_STR}"
+        ))
     }
 }
 
@@ -1787,60 +1785,48 @@ fn validate_schema_static(dataset: &Dataset) -> Result<(), String> {
 ///
 /// Failing in `configure()` makes every abort instant and leaves nothing behind.
 ///
-/// Shipped datasets affected: the two `random-geo-radius-*-angular-filters`
-/// (geo, every KiviDB version) and `arxiv-titles-384-angular-filters`
-/// (multi-valued `labels`, only on servers older than 1.0.5; from 1.0.5 it is
-/// declared `TAG SEPARATOR ;` and filtered). On a server whose version cannot
-/// be read, every dataset that declares a TAG field is refused too (see
-/// [`tag_declaration`]); vector-only and numeric/text-only schemas still run.
+/// Shipped datasets affected on KiviDB >= 1.1.2: the two
+/// `random-geo-radius-*-angular-filters` (geo, every KiviDB version). On an
+/// older server, or one whose version cannot be read, every dataset that
+/// declares a TAG field is refused too (see [`tag_declaration`]), including
+/// `arxiv-titles-384-angular-filters` and its multi-valued `labels`;
+/// vector-only and numeric/text-only schemas still run.
 fn validate_dataset_support(dataset: &Dataset, server: &KividbServer) -> Result<(), String> {
     validate_schema_static(dataset)?;
     let Some(schema) = dataset.config.schema.as_ref().and_then(|s| s.as_object()) else {
         return Ok(());
     };
     let dataset_name = &dataset.config.name;
-    let tags = server.tag_semantics();
+    if server.tags_supported() {
+        return Ok(());
+    }
     let reported = server.describe();
     for (field_name, field_type) in schema {
         let field_type = field_type.as_str().unwrap_or("");
         if !is_tag_type(field_type) {
             continue;
         }
-        match tags {
-            None => {
-                return Err(format!(
-                    "KiviDB cannot benchmark dataset `{dataset_name}` on this server: {reported}, \
-                     so its TAG semantics are unknown and no declaration of the {field_type} \
-                     field `{field_name}` is known to be right. KiviDB >= 1.0.5 splits a bare \
-                     TAG on `,` (a stored `Smith, John` stops matching itself) and needs \
-                     `SEPARATOR ;`, which KiviDB < 1.0.5 rejects; guessing either way risks \
-                     publishing a recall for a filter that matched the wrong documents. \
-                     Per-run remedies: point the run at a KiviDB server that reports \
-                     `kividb_version` (every published image does), or drop this dataset from \
-                     `--datasets`."
-                ));
-            }
-            Some(TagSemantics::Atomic)
-                if field_type == "keyword" && is_multivalued_keyword_field(field_name) =>
-            {
-                return Err(format!(
-                    "KiviDB cannot benchmark dataset `{dataset_name}` on this server: its schema \
-                     declares the multi-valued keyword field `{field_name}`, and {reported}. \
-                     Before KiviDB 1.0.5 a TAG value is ATOMIC — `FT.CREATE` rejects the \
-                     `SEPARATOR` modifier outright and `@{field_name}:{{b}}` does not match a \
-                     stored `a;b;c` — so a `match_any` over `{field_name}` could only ever match \
-                     the whole joined string, i.e. zero documents, and the run would publish \
-                     recall 0.0 for a filter that was never applied. Per-run remedies: run \
-                     against KiviDB >= 1.0.5, which splits TAG values on `SEPARATOR`; drop this \
-                     dataset from `--datasets` and use its unfiltered twin \
-                     `arxiv-titles-384-angular-no-filters` for a pure-KNN KiviDB number, or \
-                     keep the sweep going past it with `--exit-on-error false`. Do NOT edit the \
-                     field out of `datasets/datasets.json` — that file is shared, and qdrant, \
-                     milvus, weaviate, pgvector and elasticsearch all filter this field natively."
-                ));
-            }
-            Some(_) => {}
-        }
+        let multivalued = if field_type == "keyword" && is_multivalued_keyword_field(field_name) {
+            format!(
+                " (`{field_name}` is multi-valued: a `match_any` over it needs the TAG to split \
+                 on `;`, which no unverified declaration guarantees; for a pure-KNN KiviDB \
+                 number use the unfiltered twin `arxiv-titles-384-angular-no-filters`)"
+            )
+        } else {
+            String::new()
+        };
+        return Err(format!(
+            "KiviDB cannot benchmark dataset `{dataset_name}` on this server: {reported}. This \
+             tool declares TAG fields (here the {field_type} field `{field_name}`{multivalued}) \
+             as `TAG SEPARATOR ;` on KiviDB >= {TAG_MIN_VERSION_STR} only. On any other \
+             server no declaration is known to be right: a bare TAG splits on `,` where \
+             RediSearch semantics apply (a stored `Smith, John` stops matching itself), and \
+             a server that does not support `SEPARATOR` rejects it, so guessing either way \
+             risks publishing a recall for a filter that matched the wrong documents. Per-run \
+             remedies: run against KiviDB {TAG_MIN_VERSION_STR} or newer; drop this dataset \
+             from `--datasets`; or keep the sweep going past it with `--exit-on-error false`. \
+             Do NOT edit the field out of `datasets/datasets.json` — that file is shared."
+        ));
     }
     Ok(())
 }
@@ -2152,7 +2138,7 @@ impl Engine for KividbEngine {
             self.config.algorithm, self.config.m, self.config.ef_construction
         );
 
-        self.create_index(&mut conn, dataset, server.tag_semantics())?;
+        self.create_index(&mut conn, dataset, server.tags_supported())?;
         // Best-effort; see check_commandstats note in upload()/search() below.
         self.commandstats_baseline = redis_utils::reset_commandstats(&mut conn)?;
         self.commandstats_primed = true;
@@ -2264,7 +2250,7 @@ impl Engine for KividbEngine {
         // trip); the index-existence guard: on that path a missing or
         // mismatched index would otherwise write a silent recall-0.0 result
         // file; and the index's TAG declarations as the SERVER reports them
-        // (FT.INFO), so a reused index built bare on a >= 1.0.5 server (it
+        // (FT.INFO), so a reused index built bare (a bare TAG
         // splits on `,`) is refused rather than measured. All run before the
         // queries are read, outside every timed window.
         {
@@ -2284,7 +2270,7 @@ impl Engine for KividbEngine {
                     &self.config.index_name,
                     ft_info_tag_separators(&info)?.as_ref(),
                     &tag_fields,
-                    server.tag_semantics(),
+                    server.tags_supported(),
                 )?;
             }
         }
@@ -2587,14 +2573,15 @@ mod tests {
     }
 
     #[test]
-    fn multivalued_labels_rejected_only_without_tag_separator_support() {
+    fn multivalued_labels_rejected_below_the_minimum_version() {
         let ds = dataset_with_schema(serde_json::json!({"labels": "keyword"}));
-        for v in [Some("1.0.2"), Some("1.0.4")] {
+        for v in [Some("1.1.0"), Some("1.1.1"), Some("1.1.1-rc3")] {
             let err = validate_dataset_support(&ds, &server(v)).unwrap_err();
-            assert!(err.contains("multi-valued keyword field `labels`"), "{err}");
-            assert!(err.contains("1.0.5"), "remedy must name the version: {err}");
+            assert!(err.contains("keyword field `labels`"), "{err}");
+            assert!(err.contains("multi-valued"), "{err}");
+            assert!(err.contains("1.1.2"), "remedy must name the version: {err}");
         }
-        for v in ["1.0.5", "1.0.5-rc1", "1.0.6-rc4"] {
+        for v in ["1.1.2", "1.1.2-rc1", "1.1.3", "1.2.0-rc2"] {
             validate_dataset_support(&ds, &server(Some(v)))
                 .unwrap_or_else(|e| panic!("{v} indexes `labels` as TAG SEPARATOR ;: {e}"));
         }
@@ -2606,25 +2593,28 @@ mod tests {
     #[test]
     fn rejection_names_what_the_server_reported() {
         let ds = dataset_with_schema(serde_json::json!({"labels": "keyword"}));
-        let err = validate_dataset_support(&ds, &server(Some("1.0.2"))).unwrap_err();
-        assert!(err.contains("`kividb_version:1.0.2`"), "{err}");
-        let err = validate_dataset_support(&ds, &server(Some("v1.0.7"))).unwrap_err();
+        let err = validate_dataset_support(&ds, &server(Some("1.1.1"))).unwrap_err();
         assert!(
-            err.contains("`kividb_version:v1.0.7`, which is not a"),
+            err.contains("`kividb_version:1.1.1`, older than 1.1.2"),
+            "{err}"
+        );
+        let err = validate_dataset_support(&ds, &server(Some("v1.1.2"))).unwrap_err();
+        assert!(
+            err.contains("`kividb_version:v1.1.2`, which is not a"),
             "{err}"
         );
         let err = validate_dataset_support(&ds, &server(None)).unwrap_err();
         assert!(err.contains("no `kividb_version` field"), "{err}");
     }
 
-    /// An unknown version has no TAG declaration known to be right (bare splits
-    /// on `,` from 1.0.5; `SEPARATOR` is rejected before it), so EVERY TAG-typed
-    /// field is refused, not only `labels`. Schemas without one still run.
+    /// An unknown or unsupported version has no TAG declaration known to be
+    /// right, so EVERY TAG-typed field is refused, not only `labels`. Schemas
+    /// without one still run.
     #[test]
-    fn unknown_version_refuses_every_tag_field_and_nothing_else() {
+    fn unsupported_version_refuses_every_tag_field_and_nothing_else() {
         for field_type in ["keyword", "uuid", "bool"] {
             let ds = dataset_with_schema(serde_json::json!({"f": field_type}));
-            for unknown in [None, Some("garbage")] {
+            for unknown in [None, Some("garbage"), Some("1.1.1"), Some("1.1.0")] {
                 let err = validate_dataset_support(&ds, &server(unknown)).unwrap_err();
                 assert!(
                     err.contains(&format!("{field_type} field `f`")),
@@ -2634,54 +2624,52 @@ mod tests {
         }
         let ds = dataset_with_schema(serde_json::json!({"n": "int", "x": "float", "t": "text"}));
         validate_dataset_support(&ds, &server(None)).expect("no TAG field, nothing to guess");
+        validate_dataset_support(&ds, &server(Some("1.1.1"))).expect("no TAG field");
         let ds = dataset_with_schema(serde_json::Value::Null);
         validate_dataset_support(&ds, &server(None)).expect("vector-only dataset");
+        validate_dataset_support(&ds, &server(Some("1.1.0"))).expect("vector-only dataset");
     }
 
     #[test]
     fn geo_is_rejected_on_every_server_version() {
         let ds = dataset_with_schema(serde_json::json!({"location": "geo"}));
         validate_schema_static(&ds).unwrap_err();
-        for v in [None, Some("1.0.2"), Some("1.0.5")] {
+        for v in [None, Some("1.1.1"), Some("1.1.2"), Some("1.2.0")] {
             let err = validate_dataset_support(&ds, &server(v)).unwrap_err();
             assert!(err.contains("geo"), "{err}");
         }
     }
 
     #[test]
-    fn scalar_keyword_is_accepted_on_every_known_server_version() {
+    fn scalar_keyword_is_accepted_on_every_supported_server_version() {
         let ds = dataset_with_schema(serde_json::json!({"color": "keyword", "n": "int"}));
-        for v in ["1.0.2", "1.0.4", "1.0.5", "1.0.6-rc4"] {
+        for v in ["1.1.2-rc1", "1.1.2", "1.1.10", "1.2.0-rc2", "2.0.0"] {
             validate_dataset_support(&ds, &server(Some(v))).expect("scalar fields are fine");
         }
     }
 
-    /// The declaration each server gets. From 1.0.5 a bare TAG splits on `,`
-    /// (measured: `@s:{Smith, John}` returns 0 for a stored `Smith, John`), so
-    /// a SCALAR field must be `SEPARATOR ;` there too, exactly as redis.rs
-    /// declares it; before 1.0.5 `SEPARATOR` is rejected and bare is atomic.
+    /// The declaration each server gets. A bare TAG splits on `,` (measured on
+    /// 1.1.2: `@s:{Smith}` matches a stored `Smith, John`), so a SCALAR field
+    /// must be `SEPARATOR ;` too, exactly as redis.rs declares it; an
+    /// unsupported server gets no declaration at all.
     #[test]
-    fn tag_declaration_follows_server_semantics() {
-        use TagSemantics::*;
-        for (field, ty) in [("color", "keyword"), ("id", "uuid"), ("flag", "bool")] {
+    fn tag_declaration_follows_server_support() {
+        for (field, ty) in [
+            ("color", "keyword"),
+            ("id", "uuid"),
+            ("flag", "bool"),
+            ("labels", "keyword"),
+        ] {
             assert_eq!(
-                tag_declaration(field, ty, Some(Separator)).unwrap(),
+                tag_declaration(field, ty, true).unwrap(),
                 &["TAG", "SEPARATOR", ";"],
-                "{ty} on >= 1.0.5"
+                "{ty} on a supported server"
             );
-            assert_eq!(
-                tag_declaration(field, ty, Some(Atomic)).unwrap(),
-                &["TAG"],
-                "{ty} on < 1.0.5"
+            assert!(
+                tag_declaration(field, ty, false).is_err(),
+                "{ty} on an unsupported server"
             );
-            assert!(tag_declaration(field, ty, None).is_err(), "{ty} on unknown");
         }
-        assert_eq!(
-            tag_declaration("labels", "keyword", Some(Separator)).unwrap(),
-            &["TAG", "SEPARATOR", ";"]
-        );
-        assert!(tag_declaration("labels", "keyword", Some(Atomic)).is_err());
-        assert!(tag_declaration("labels", "keyword", None).is_err());
     }
 
     /// The FT.INFO declaration check in `search()` is scoped by
