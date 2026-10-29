@@ -2564,7 +2564,10 @@ mod tests {
         let err = validate_dataset_support(&ds, &server(Some("1.0.2"))).unwrap_err();
         assert!(err.contains("`kividb_version:1.0.2`"), "{err}");
         let err = validate_dataset_support(&ds, &server(Some("v1.0.7"))).unwrap_err();
-        assert!(err.contains("`kividb_version:v1.0.7`, which is not a"), "{err}");
+        assert!(
+            err.contains("`kividb_version:v1.0.7`, which is not a"),
+            "{err}"
+        );
         let err = validate_dataset_support(&ds, &server(None)).unwrap_err();
         assert!(err.contains("no `kividb_version` field"), "{err}");
     }

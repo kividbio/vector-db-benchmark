@@ -639,7 +639,10 @@ fn test_binary_kividb_multivalued_labels_match_any() {
     );
     match semantics {
         TagSemantics::Separator => {
-            assert!(ok, "kividb multi-valued labels run failed on a >= 1.0.5 server");
+            assert!(
+                ok,
+                "kividb multi-valued labels run failed on a >= 1.0.5 server"
+            );
             let recall = common::read_recall(&proj.root, "kividb-labels");
             println!("kividb match_any labels recall={:.3}", recall);
             assert!(

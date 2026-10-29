@@ -187,7 +187,15 @@ mod tests {
     #[test]
     fn rejects_malformed_versions() {
         for v in [
-            "1.0", "1.0.5.1", "x.y.z", "", "v1.0.5", "+1.0.5", "1.+0.5", "1.0.5-", "1.0.5-r c",
+            "1.0",
+            "1.0.5.1",
+            "x.y.z",
+            "",
+            "v1.0.5",
+            "+1.0.5",
+            "1.+0.5",
+            "1.0.5-",
+            "1.0.5-r c",
         ] {
             assert_eq!(parse_kividb_version(&info(v)), None, "{v:?} must not parse");
             assert_eq!(semantics(v), None, "{v:?} must read as unknown");
