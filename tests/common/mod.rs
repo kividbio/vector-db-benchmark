@@ -678,7 +678,13 @@ pub fn write_comma_keyword_project(
     dim: usize,
 ) -> FilterProject {
     let author = |id: usize| ["Smith, John", "Smith", "John"][id % 3];
-    let wanted = |q: usize| if q % 2 == 0 { "Smith, John" } else { "Smith" };
+    let wanted = |q: usize| {
+        if q.is_multiple_of(2) {
+            "Smith, John"
+        } else {
+            "Smith"
+        }
+    };
     write_filter_project_multi(
         dataset_name,
         engine_configs_json,
