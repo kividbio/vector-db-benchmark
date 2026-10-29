@@ -662,6 +662,36 @@ fn write_filter_project_multi(
     }
 }
 
+/// Scalar keyword values that CONTAIN A COMMA: field `author` (schema type
+/// `keyword`) holds `Smith, John` (id % 3 == 0), `Smith` (== 1) or `John`
+/// (== 2). Even queries filter `author == "Smith, John"`, odd ones
+/// `author == "Smith"`.
+///
+/// Guards the TAG declaration, not the filter syntax: an engine whose index
+/// splits a scalar on `,` (a bare RediSearch-style TAG, whose default
+/// separator is `,`, and KiviDB >= 1.0.5's) indexes `Smith, John` as `Smith` +
+/// `John`, so the even queries match nothing and the odd ones also match every
+/// `Smith, John` document. Either way recall collapses.
+pub fn write_comma_keyword_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+) -> FilterProject {
+    let author = |id: usize| ["Smith, John", "Smith", "John"][id % 3];
+    let wanted = |q: usize| if q % 2 == 0 { "Smith, John" } else { "Smith" };
+    write_filter_project_multi(
+        dataset_name,
+        engine_configs_json,
+        dim,
+        GtMetric::L2,
+        N_QUERIES,
+        serde_json::json!({ "author": "keyword" }),
+        move |id| serde_json::json!({ "author": author(id) }),
+        move |q| serde_json::json!({ "and": [ { "author": { "match": { "value": wanted(q) } } } ] }),
+        move |q, id| author(id) == wanted(q),
+    )
+}
+
 /// bool filter: field `flag` (schema type `bool`), value `id % 2 == 0`. The
 /// query filters `flag == true`, so half the corpus matches.
 pub fn write_bool_project(
