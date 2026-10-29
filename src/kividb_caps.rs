@@ -128,13 +128,9 @@ fn parse_version(value: &str) -> Option<KividbVersion> {
         }
         None => (value, false),
     };
-    // `u32::from_str` accepts a leading `+`, so check digits explicitly.
-    let num = |s: &str| -> Option<u32> {
-        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        s.parse().ok()
-    };
+    // `u32::from_str` would accept a leading `+`, but none survives here: the
+    // build-metadata split above already cut the value at the first `+`.
+    let num = |s: &str| s.parse::<u32>().ok();
     let mut parts = core.split('.');
     let major = num(parts.next()?)?;
     let minor = num(parts.next()?)?;
