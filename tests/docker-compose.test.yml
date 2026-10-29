@@ -198,6 +198,21 @@ services:
       timeout: 3s
       retries: 15
 
+  # The last pre-1.0.5 image CI used. KiviDB < 1.0.5 rejects TAG `SEPARATOR` and
+  # stores TAG values atomically, so the engine takes a different branch there
+  # (bare TAGs, multi-valued `labels` rejected); `make
+  # integration-test-kividb-legacy` runs the suite against it with
+  # KIVIDB_EXPECT_TAG_SEMANTICS=atomic so that branch stays live-tested.
+  kividb-legacy:
+    image: quay.io/kividbio/kividb:v1.0.2-full
+    ports:
+      - "6387:6380"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6380"]
+      interval: 1s
+      timeout: 3s
+      retries: 15
+
   chroma:
     image: chromadb/chroma:1.0.0
     environment:
